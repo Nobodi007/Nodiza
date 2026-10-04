@@ -190,18 +190,19 @@ with trade_tab:
                     single_buy.append((one_coins, q, one_fee))
                 except ValueError:
                     pass
-            single_best = max(single_buy, key=lambda row: row[0]) if single_buy else None
+            buy_single_best = max(single_buy, key=lambda row: row[0]) if single_buy else None
             st.caption(f"ประมาณได้รับ {route_coins:.8f} {coin} หลังหักค่าธรรมเนียม | Fee รวม ฿{route_fee:,.2f}")
             st.metric("Execution average buy price", f"฿{buy_avg:,.2f}/{coin}")
-            if single_best:
-                gain = route_coins - single_best[0]
-                st.caption(f"เทียบกับกระดานเดียวที่ดีที่สุด: {gain:+.8f} {coin} ({gain / single_best[0] * 100:+.3f}%)")
+            if buy_single_best:
+                gain = route_coins - buy_single_best[0]
+                st.caption(f"เทียบกับกระดานเดียวที่ดีที่สุด: {gain:+.8f} {coin} ({gain / buy_single_best[0] * 100:+.3f}%)")
         else:
             buy_legs = []
             st.warning("สภาพคล่อง Ask รวมของทุก Exchange ไม่เพียงพอสำหรับยอดนี้")
         if st.button(f"Auto Buy {coin}", type="primary", disabled=stale or not (buy_route and 0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
             try:
-                received = portfolio.buy_split(buy_legs)
+                baseline = (buy_single_best[1].exchange, buy_single_best[0]) if buy_route and buy_single_best else None
+                received = portfolio.buy_split(buy_legs, baseline)
                 st.session_state.flash = f"Split-routed buy: {received:.8f} {coin} across {len(buy_legs)} exchange(s)."
                 st.rerun()
             except portfolio.OrderError as e:
@@ -228,18 +229,19 @@ with trade_tab:
                     single_sell.append((one_thb, q, one_fee))
                 except ValueError:
                     pass
-            single_best = max(single_sell, key=lambda row: row[0]) if single_sell else None
+            sell_single_best = max(single_sell, key=lambda row: row[0]) if single_sell else None
             st.caption(f"ประมาณรับ ฿{route_proceeds:,.2f} หลังหักค่าธรรมเนียม | Fee รวม ฿{route_sell_fee:,.2f}")
             st.metric("Execution average sell price", f"฿{sell_avg:,.2f}/{coin}")
-            if single_best:
-                improvement = route_proceeds - single_best[0]
-                st.caption(f"เทียบกับกระดานเดียวที่ดีที่สุด: {improvement:+,.2f} THB ({improvement / single_best[0] * 100:+.3f}%)")
+            if sell_single_best:
+                improvement = route_proceeds - sell_single_best[0]
+                st.caption(f"เทียบกับกระดานเดียวที่ดีที่สุด: {improvement:+,.2f} THB ({improvement / sell_single_best[0] * 100:+.3f}%)")
         else:
             sell_legs = []
             st.warning("สภาพคล่อง Bid รวมของทุก Exchange ไม่เพียงพอสำหรับจำนวนนี้")
         if st.button(f"Auto Sell {coin}", type="primary", disabled=stale or not (sell_route and 0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
             try:
-                received_thb = portfolio.sell_split(sell_legs)
+                baseline = (sell_single_best[1].exchange, sell_single_best[0]) if sell_route and sell_single_best else None
+                received_thb = portfolio.sell_split(sell_legs, baseline)
                 st.session_state.flash = f"Split-routed sell across {len(sell_legs)} exchange(s): ฿{received_thb:,.2f}."
                 st.rerun()
             except portfolio.OrderError as e:
@@ -321,6 +323,19 @@ with history_tab:
         m1.metric("Avg slippage vs top of book", f"{sum(slips) / len(slips):.4%}")
         m2.metric("Worst slippage", f"{max(slips):.4%}")
         m3.metric("Avg quote latency", f"{sum(lats) / len(lats):.0f} ms" if lats else "n/a (mock)")
+    rs = portfolio.get_route_stats(live=(mode == "Live data"))
+    st.subheader("Smart routing vs best single exchange")
+    if rs["compared"]:
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Routed orders compared", rs["compared"])
+        r2.metric("Split beat single", f"{rs['wins']}/{rs['compared']}")
+        r3.metric("Total gained", f"฿{rs['total_gain_thb']:,.2f}")
+        r4.metric("Avg improvement", f"{rs['avg_gain_pct']:.4%}")
+        st.caption(f"Counts only {mode} orders. Baseline = the best single exchange for the same order at the same moment."
+                   + (f" {rs['split_only']} order(s) had no single exchange with enough liquidity." if rs["split_only"] else ""))
+    else:
+        st.caption(f"No Auto Buy / Auto Sell orders in {mode} mode yet.")
+    st.subheader("Order history")
     if orders:
         st.dataframe(
             pd.DataFrame({
