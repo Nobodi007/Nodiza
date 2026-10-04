@@ -12,7 +12,9 @@ V0.1 only needs get_price(). Later versions will add get_orderbook(),
 get_balance(), place_order() and cancel_order() to the same interface.
 """
 import random
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -127,6 +129,11 @@ def build_mock_exchanges() -> list[Exchange]:
     ]
 
 
+_CACHE: dict[tuple[str, str], tuple[float, "Quote"]] = {}
+_CACHE_LOCK = threading.Lock()
+CACHE_TTL = 2.0  # seconds: stops rapid "Refresh" clicks from hammering public APIs
+
+
 class RealExchange(Exchange):
     """Public order-book adapter. No API key, no trading: market data only.
 
@@ -160,6 +167,12 @@ class RealExchange(Exchange):
         return out
 
     def get_price(self, symbol: str) -> Quote:
+        key = (self.name, symbol)
+        with _CACHE_LOCK:
+            hit = _CACHE.get(key)
+        if hit and time.time() - hit[0] < CACHE_TTL:
+            self.last_error = None
+            return hit[1]
         try:
             url, params = self._params(symbol)
             t0 = time.perf_counter()
@@ -172,9 +185,12 @@ class RealExchange(Exchange):
             if not asks or not bids:
                 raise ValueError("empty order book")
             self.last_error = None
-            return Quote(self.name, symbol, bid=bids[0][0], ask=asks[0][0],
+            quote = Quote(self.name, symbol, bid=bids[0][0], ask=asks[0][0],
                          fee_rate=self.fee_rate, asks=asks, bids=bids, live=True,
                          latency_ms=latency_ms)
+            with _CACHE_LOCK:
+                _CACHE[key] = (time.time(), quote)
+            return quote
         except Exception as e:                             # network, JSON, parsing...
             self.last_error = f"{type(e).__name__}: {e}"
             if self.fallback is None:
@@ -219,3 +235,11 @@ def build_exchanges(mode: str = "Mock") -> list[Exchange]:
         BinanceTHExchange(fallback=MockExchange("Binance TH", 0.0010, 0.0010, -0.0010)),
         mocks[0],   # keep one mock so routing still has 3 venues to compare
     ]
+
+
+def fetch_quotes(exchanges: list[Exchange], symbol: str) -> list[Quote]:
+    """Ask every exchange for its quote at the same time. Order is preserved."""
+    if len(exchanges) <= 1:
+        return [ex.get_price(symbol) for ex in exchanges]
+    with ThreadPoolExecutor(max_workers=len(exchanges)) as pool:
+        return list(pool.map(lambda ex: ex.get_price(symbol), exchanges))
