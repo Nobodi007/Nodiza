@@ -11,12 +11,17 @@ Two ideas live here:
 V0.1 only needs get_price(). Later versions will add get_orderbook(),
 get_balance(), place_order() and cancel_order() to the same interface.
 """
+import hashlib
+import hmac
+import json
 import os
 import random
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlsplit
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -197,6 +202,10 @@ class RealExchange(Exchange):
     def _headers(self) -> dict:
         return {}
 
+    def _fetch(self, url: str, params: dict):
+        """Default: plain GET. Adapters needing POST/signing override this."""
+        return requests.get(url, params=params, headers=self._headers(), timeout=self.timeout)
+
     def configured(self) -> bool:
         """False = missing key/URL; build_exchanges() then leaves this venue out instead of faking prices."""
         return True
@@ -224,7 +233,7 @@ class RealExchange(Exchange):
         try:
             url, params = self._params(symbol)
             t0 = time.perf_counter()
-            r = requests.get(url, params=params, headers=self._headers(), timeout=self.timeout)
+            r = self._fetch(url, params)
             latency_ms = (time.perf_counter() - t0) * 1000
             if not r.ok:                       # show the exchange's own error message
                 raise requests.HTTPError(f"{r.status_code}: {r.text[:200]}")
@@ -241,7 +250,7 @@ class RealExchange(Exchange):
                 _CACHE[key] = (time.time(), quote)
             return quote
         except Exception as e:                             # network, JSON, parsing...
-            self.last_error = f"{type(e).__name__}: {e} [GET {url}]{getattr(self, 'debug_note', '')}"
+            self.last_error = f"{type(e).__name__}: {e} [{url}]{getattr(self, 'debug_note', '')}"
             if self.fallback is None:
                 raise
             q = self.fallback.get_price(symbol)
@@ -302,37 +311,54 @@ class MaxbitExchange(RealExchange):
         return data["asks"], data["bids"]
 
 
-class InnovestXExchange(MaxbitExchange):
-    """InnovestX. I could NOT find its public API docs, so nothing is guessed here:
-    set INNOVESTX_API_KEY (read-only key) and INNOVESTX_BASE_URL (its API host, from InnovestX's docs).
-    Optional INNOVESTX_DEPTH_PATH (default /api/v1/depth). Assumes a Binance-style depth response."""
+class InnovestXExchange(RealExchange):
+    """InnovestX digital-asset Open API (https://api-docs.innovestxonline.com/).
+
+    POST /api/v1/digital-asset/orderbook/lvl2 with JSON {"symbol": "BTCTHB", "depth": N}.
+    Auth: X-INVX-APIKEY + X-INVX-SIGNATURE = HMAC-SHA256(secret, apikey+VERB+host+path+query+
+    content-type+request-uid+timestamp+body). Needs a key with Read (or Trading) permission, and
+    the machine's IP must be on the key's whitelist (error 4003 otherwise).
+
+    Env / Secrets: INNOVESTX_API_KEY, INNOVESTX_API_SECRET.
+    Optional: INNOVESTX_BASE_URL (default https://api.innovestxonline.com), INNOVESTX_DEPTH_PATH.
+    The secret only signs the request; it is never sent."""
     name = "InnovestX"
-    fee_rate = 0.0025          # placeholder: check InnovestX's real fee
-    KEY_VAR = "INNOVESTX_API_KEY"
+    fee_rate = 0.0025          # placeholder: check InnovestX's real fee (POST /symbol/fee/tier)
+    DEFAULT_BASE = "https://api.innovestxonline.com"
+    DEFAULT_PATH = "/api/v1/digital-asset/orderbook/lvl2"
+    DEPTH = 100
 
     def configured(self):
-        return bool(_secret(self.KEY_VAR) and _secret("INNOVESTX_BASE_URL"))
-
-    def _headers(self):
-        """Header name via INNOVESTX_HEADER (default X-MBX-APIKEY).
-        Use e.g. INNOVESTX_HEADER=Authorization together with INNOVESTX_AUTH_PREFIX=Bearer."""
-        key = _secret(self.KEY_VAR)
-        if not key:
-            raise RuntimeError(f"{self.KEY_VAR} is not set")
-        self.debug_note = f" [key length sent: {len(key)}]"
-        name = _secret("INNOVESTX_HEADER") or "X-MBX-APIKEY"
-        prefix = _secret("INNOVESTX_AUTH_PREFIX")
-        return {name: f"{prefix} {key}" if prefix else key}
+        return bool(_secret("INNOVESTX_API_KEY") and _secret("INNOVESTX_API_SECRET"))
 
     def _params(self, symbol):
-        """Symbol format via INNOVESTX_SYMBOL_FMT, default {base}THB. Placeholders: {base} {quote}
-        (BASE/QUOTE upper case; use {base_l} {quote_l} for lower case). Example: {base}_{quote}"""
-        base, quote = symbol.split("/")
-        fmt = _secret("INNOVESTX_SYMBOL_FMT") or "{base}{quote}"
-        sym = fmt.format(base=base.upper(), quote=quote.upper(), base_l=base.lower(), quote_l=quote.lower())
-        base_url = _secret("INNOVESTX_BASE_URL").rstrip("/")
-        path = _secret("INNOVESTX_DEPTH_PATH") or "/api/v1/depth"
-        return base_url + path, {"symbol": sym, "limit": 20}
+        base_url = (_secret("INNOVESTX_BASE_URL") or self.DEFAULT_BASE).rstrip("/")
+        path = _secret("INNOVESTX_DEPTH_PATH") or self.DEFAULT_PATH
+        return base_url + path, {"symbol": f"{symbol.split('/')[0].upper()}THB", "depth": self.DEPTH}
+
+    def _fetch(self, url, body):
+        key, secret = _secret("INNOVESTX_API_KEY"), _secret("INNOVESTX_API_SECRET")
+        if not key or not secret:
+            raise RuntimeError("INNOVESTX_API_KEY and INNOVESTX_API_SECRET must both be set")
+        self.debug_note = f" [key length sent: {len(key)}]"
+        body_str = json.dumps(body, separators=(",", ":"))          # sign exactly what we send
+        parts = urlsplit(url)
+        uid, ts, ctype = str(uuid.uuid4()), str(int(time.time() * 1000)), "application/json"
+        query = f"?{parts.query}" if parts.query else ""
+        to_sign = key + "POST" + parts.netloc.lower() + parts.path + query + ctype + uid + ts + body_str
+        sig = hmac.new(secret.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+        headers = {"Content-Type": ctype, "X-INVX-APIKEY": key, "X-INVX-SIGNATURE": sig,
+                   "X-INVX-REQUEST-UID": uid, "X-INVX-TIMESTAMP": ts}
+        return requests.post(url, data=body_str, headers=headers, timeout=self.timeout)
+
+    def _parse(self, data):
+        if str(data.get("code")) != "0000":
+            hint = " (IP not whitelisted for this key)" if str(data.get("code")) == "4003" else ""
+            raise ValueError(f"InnovestX {data.get('code')}: {data.get('message')}{hint}")
+        rows = [r for r in data.get("data", []) if r.get("actionType", 0) != 2]   # 2 = deletion
+        bids = [[r["price"], r["quantity"]] for r in rows if r.get("side") == 0]   # 0 = buy side
+        asks = [[r["price"], r["quantity"]] for r in rows if r.get("side") == 1]   # 1 = sell side
+        return asks, bids
 
 
 def build_exchanges(mode: str = "Mock") -> list[Exchange]:
