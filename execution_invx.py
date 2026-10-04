@@ -1,36 +1,45 @@
 """
-execution_invx.py — order placement on InnovestX for Crypto Mall (roadmap: real execution, tiny size).
+execution_invx.py — order placement on InnovestX for Crypto Mall (roadmap Phase 10, tiny size).
 
-STATUS: SCAFFOLD. The safety model and order flow are finished and tested, but the InnovestX
-order endpoints (paths + field names) are NOT verified. Every unverified item is marked
-"UNVERIFIED" and is isolated in build_order_payload() / parse_order_response() / the INVX_*_PATH
-settings, so confirming them against api-docs.innovestxonline.com means editing those spots only.
+Endpoints, fields and error codes follow the InnovestX Open API docs:
+  POST /api/v1/digital-asset/order/send            (Trading permission)
+  POST /api/v1/digital-asset/order/cancel          (Trading)
+  POST /api/v1/digital-asset/order/history/inquiry (Read/Trading)   <- order status by clientOrderId
+  GET  /api/v1/digital-asset/order/open/inquiry    (Read/Trading)
+  GET  /api/v1/digital-asset/account/balance/inquiry
+  GET  /api/v1/digital-asset/symbols               (quantity / price increments)
+Things the docs leave unclear are marked "UNVERIFIED" (checked on the first tiny live order).
 
-SAFETY MODEL — a real order needs ALL of these, otherwise the call is a DRY-RUN
-(payload is built and logged, NOTHING is sent):
+HOW AN ORDER IS SENT
+  * Default order = a marketable LIMIT (limit price = reference price +/- INVX_SLIPPAGE_PCT, default 0.3%),
+    so a thin book can never fill you far from the price you saw. Set INVX_ORDER_TYPE=MARKET for market orders.
+  * The send reply only contains an orderId, so the fill is read back by our own clientOrderId.
+  * timeInForce can only be GTC, so a leftover (unfilled) part would stay on the book: we cancel it.
+
+SAFETY MODEL — a real order needs ALL of these, otherwise the call is a DRY-RUN (nothing is sent):
   1. EXEC_ENABLED=1
-  2. INVX_ALLOW_LIVE=1                (second, separate switch just for real money)
-  3. INVX_ORDER_PATH is set           (no default on purpose: forces you to confirm it in the docs)
-  4. INNOVESTX_API_KEY / SECRET set   (key must have Trading permission + IP whitelisted)
-  5. kill switch OFF, symbol allow-listed, order <= INVX_MAX_ORDER_THB, day total <= INVX_MAX_DAILY_THB
-Other rules carried over from execution.py:
+  2. INVX_ALLOW_LIVE=1                (second switch just for real money)
+  3. INNOVESTX_API_KEY / SECRET set   (the key needs Trading permission; Withdraw/Deposit should stay OFF)
+  4. kill switch OFF, symbol allow-listed, order <= INVX_MAX_ORDER_THB, day total <= INVX_MAX_DAILY_THB
   * the order is written to the DB BEFORE it is sent (write-ahead), with our own client order id
-  * a timeout / 5xx is UNKNOWN, not FAILED: we look the order up by client id; unresolved stays
-    "UNKNOWN" and still counts against the daily limit
-  * after a fill the THB/coin balance change on the exchange is compared with what the fill says
+  * a timeout / 5xx / unreadable reply is UNKNOWN, not FAILED: we look the order up by client id;
+    unresolved stays "UNKNOWN" and still counts against the daily limit
+  * after a fill, the THB/coin balance change on the exchange is compared with what the fill says
 
-Env / Secrets (all optional except the keys):
-  INVX_MAX_ORDER_THB (default 300)   INVX_MAX_DAILY_THB (default 1000)
-  INVX_ORDER_PATH  INVX_ORDER_STATUS_PATH  INVX_BALANCE_PATH  INVX_CANCEL_PATH
+Env / Secrets (optional unless noted):
+  INVX_MAX_ORDER_THB (default 300)   INVX_MAX_DAILY_THB (default 1000)   INVX_SLIPPAGE_PCT (default 0.3)
+  INVX_ORDER_TYPE (LIMIT|MARKET, default LIMIT)
+  INVX_ORDER_PATH / INVX_CANCEL_PATH / INVX_HISTORY_PATH / INVX_OPEN_PATH / INVX_BALANCE_PATH (override paths)
 """
 import hashlib
 import hmac
 import json
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from urllib.parse import urlsplit
 
 import requests
@@ -43,10 +52,14 @@ from execution import (ApiError, ExecutionError, StatusUnknown, _d, _fmt, _inser
 ALLOWED_SYMBOLS = ["BTCTHB", "ETHTHB"]
 ALLOWED_HOSTS = {"api.innovestxonline.com"}
 LIVE_MODE, DRY_MODE = "invx-live", "invx-dry"
+API = "/api/v1/digital-asset"
+PATHS = {"ORDER": API + "/order/send", "CANCEL": API + "/order/cancel",
+         "HISTORY": API + "/order/history/inquiry", "OPEN": API + "/order/open/inquiry",
+         "BALANCE": API + "/account/balance/inquiry", "SYMBOLS": API + "/symbols"}
 _sleep = time.sleep                                   # tests replace this
 
 
-# --- limits (THB) --------------------------------------------------------------
+# --- limits ----------------------------------------------------------------------
 def _env_decimal(name: str, default: str) -> Decimal:
     try:
         return Decimal(_secret(name) or default)
@@ -62,12 +75,20 @@ def max_daily_thb() -> Decimal:
     return _env_decimal("INVX_MAX_DAILY_THB", "1000")
 
 
+def slippage_pct() -> Decimal:
+    return min(max(_env_decimal("INVX_SLIPPAGE_PCT", "0.3"), Decimal("0")), Decimal("5"))
+
+
+def order_type() -> str:
+    return "MARKET" if _secret("INVX_ORDER_TYPE").upper() == "MARKET" else "LIMIT"
+
+
 def allow_live() -> bool:
     return _secret("INVX_ALLOW_LIVE").lower() in ("1", "true", "yes", "on")
 
 
 def daily_notional_thb() -> Decimal:
-    """THB value of today's real orders that were accepted or are unresolved (not REJECTED)."""
+    """THB value of today's real orders that were accepted or are unresolved (not REJECTED/ERROR)."""
     init_exec_db()
     today = datetime.now().strftime("%Y-%m-%d") + "%"
     with portfolio.db() as conn:
@@ -78,7 +99,18 @@ def daily_notional_thb() -> Decimal:
     return Decimal(str(row["s"]))
 
 
+def new_client_id() -> int:
+    """clientOrderId is a Long Integer in the docs: milliseconds * 1000 + random, unique and < 2^63."""
+    return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
+
+
 # --- adapter ---------------------------------------------------------------------
+@dataclass
+class Rules:
+    qty_inc: Decimal
+    price_inc: Decimal
+
+
 class InnovestXExec:
     name = "InnovestX"
     timeout = 8
@@ -87,16 +119,17 @@ class InnovestXExec:
         self.base = (_secret("INNOVESTX_BASE_URL") or InnovestXExchange.DEFAULT_BASE).rstrip("/")
         if urlsplit(self.base).hostname not in ALLOWED_HOSTS:
             raise ExecutionError("Refusing to connect: execution only talks to api.innovestxonline.com.")
+        self._rules: dict[str, tuple[float, Rules]] = {}
 
     def configured(self) -> bool:
         return bool(_secret("INNOVESTX_API_KEY") and _secret("INNOVESTX_API_SECRET"))
 
     @staticmethod
     def path(kind: str) -> str:
-        return _secret(f"INVX_{kind}_PATH")           # "" = not confirmed yet
+        return _secret(f"INVX_{kind}_PATH") or PATHS[kind]
 
     def _signed_headers(self, method: str, url: str, body_str: str) -> dict:
-        """Same scheme as InnovestXExchange._fetch (verified there for the depth endpoint)."""
+        """Signature per the docs: HMAC-SHA256(secret, apikey+VERB+host+path+query+content-type+uid+ts+body)."""
         key, secret = _secret("INNOVESTX_API_KEY"), _secret("INNOVESTX_API_SECRET")
         if not key or not secret:
             raise ExecutionError("INNOVESTX_API_KEY / INNOVESTX_API_SECRET are not set.")
@@ -108,14 +141,14 @@ class InnovestXExec:
         return {"Content-Type": ctype, "X-INVX-APIKEY": key, "X-INVX-SIGNATURE": sig,
                 "X-INVX-REQUEST-UID": uid, "X-INVX-TIMESTAMP": ts}
 
-    def _call(self, path: str, body: dict, method: str = "POST", side_effect: bool = False) -> dict:
-        if not path:
-            raise ExecutionError("Endpoint path is not configured (see INVX_*_PATH).")
+    def _call(self, path: str, body: dict | None = None, method: str = "POST", side_effect: bool = False) -> dict:
+        """side_effect=True: an unclear reply raises StatusUnknown (the order may exist) instead of a plain error."""
         url = self.base + path
-        body_str = json.dumps(body, separators=(",", ":"))     # sign exactly what we send
+        body_str = "" if body is None else json.dumps(body, separators=(",", ":"))   # sign exactly what we send
         headers = self._signed_headers(method, url, body_str)
         try:
-            r = requests.request(method, url, data=body_str, headers=headers, timeout=self.timeout)
+            r = requests.request(method, url, data=body_str.encode() if body_str else None,
+                                 headers=headers, timeout=self.timeout)
         except Exception as e:
             if side_effect:
                 raise StatusUnknown(f"no response ({type(e).__name__})") from e
@@ -123,57 +156,99 @@ class InnovestXExec:
         try:
             data = r.json()
         except Exception:
-            data = {}
-        if r.status_code >= 500:
+            data = None
+        if r.status_code >= 500 or not isinstance(data, dict):
             if side_effect:
                 raise StatusUnknown(f"server reply unclear (HTTP {r.status_code})")
-            raise ExecutionError(f"exchange server error (HTTP {r.status_code})")
-        code = str(data.get("code")) if isinstance(data, dict) else ""
-        if not r.ok or code != "0000":                          # "0000" = success on the other endpoints
-            hint = " (IP not whitelisted for this key)" if code == "4003" else ""
-            raise ApiError(r.status_code, code, f"{data.get('message') if isinstance(data, dict) else ''}{hint}")
+            raise ExecutionError(f"exchange server error or unreadable reply (HTTP {r.status_code})")
+        code = str(data.get("code", data.get("status", "")))
+        if not r.ok or code != "0000":
+            hint = {"4003": " (IP not whitelisted for this key)",
+                    "4004": " (this API key has no Trading permission)",
+                    "4019": " (insufficient balance)"}.get(code, "")
+            detail = (data.get("data") or {}).get("detail") if isinstance(data.get("data"), dict) else ""
+            raise ApiError(r.status_code, code, f"{data.get('message')}{f' / {detail}' if detail else ''}{hint}")
         return data
 
+    # --- reads
+    def rules(self, symbol: str) -> Rules:
+        hit = self._rules.get(symbol)
+        if hit and time.time() - hit[0] < 3600:
+            return hit[1]
+        data = self._call(self.path("SYMBOLS"), method="GET")
+        for row in data.get("data") or []:
+            if row.get("symbol") == symbol:
+                rules = Rules(_d(row.get("quantityIncrement", "0")), _d(row.get("priceIncrement", "0")))
+                self._rules[symbol] = (time.time(), rules)
+                return rules
+        raise ExecutionError(f"{symbol} was not found in the exchange's symbol list.")
+
+    def balances(self) -> dict[str, Decimal]:
+        """Available = amount - hold. UNVERIFIED: the docs don't say whether `amount` includes `hold`."""
+        out = {}
+        for r in self._call(self.path("BALANCE"), method="GET").get("data") or []:
+            if r.get("product"):
+                out[str(r["product"]).upper()] = _d(r.get("amount", "0")) - _d(r.get("hold", "0"))
+        return out
+
+    def get_order(self, symbol: str, client_id: int) -> dict | None:
+        """Latest known row for our client order id (history first, then open orders). None = not visible."""
+        rows = []
+        try:
+            data = self._call(self.path("HISTORY"), {"symbol": symbol, "clientOrderId": int(client_id), "depth": 10})
+            rows = [r for r in data.get("data") or [] if str(r.get("clientOrderId")) == str(client_id)]
+        except ApiError as e:
+            if e.code not in ("4041", "4001"):
+                raise
+        if not rows:
+            data = self._call(self.path("OPEN"), method="GET")
+            rows = [r for r in data.get("data") or [] if str(r.get("clientOrderId")) == str(client_id)]
+        return max(rows, key=lambda r: str(r.get("receiveDateTime", ""))) if rows else None
+
+    # --- writes
     def new_order(self, payload: dict) -> dict:
         return self._call(self.path("ORDER"), payload, side_effect=True)
 
-    def get_order(self, symbol: str, client_order_id: str) -> dict:
-        return self._call(self.path("ORDER_STATUS"), {"symbol": symbol, "clientOrderId": client_order_id})
-
-    def balances(self) -> dict[str, Decimal]:
-        data = self._call(self.path("BALANCE"), {})
-        return parse_balances(data)
+    def cancel_order(self, client_id: int) -> dict:
+        return self._call(self.path("CANCEL"), {"clientOrderId": int(client_id), "orderId": None}, side_effect=True)
 
 
-# --- UNVERIFIED: field names. Confirm against the InnovestX docs, then edit only here. --------
-def build_order_payload(symbol: str, side: str, quantity: Decimal, client_id: str) -> dict:
-    """UNVERIFIED. `side` 0/1 mirrors the depth endpoint (0 = buy, 1 = sell); the rest are guesses."""
-    return {"symbol": symbol, "side": 0 if side == "BUY" else 1, "orderType": _secret("INVX_ORDER_TYPE") or "MARKET",
-            "quantity": _fmt(quantity), "clientOrderId": client_id}
+# --- payload / response parsing (field names from the docs) --------------------------
+def _round_to(x: Decimal, inc: Decimal, mode) -> Decimal:
+    return x if inc <= 0 else (x / inc).to_integral_value(rounding=mode) * inc
 
 
-def parse_order_response(resp: dict) -> dict:
-    """UNVERIFIED. Returns {status, order_id, executed_qty, quote_qty}. status in
-    FILLED / PARTIALLY_FILLED / NEW / CANCELED / REJECTED / UNKNOWN."""
-    d = resp.get("data") or {}
-    d = d[0] if isinstance(d, list) and d else d
-    raw = str(d.get("status", d.get("orderStatus", ""))).upper()
-    status = {"FILLED": "FILLED", "PARTIALLY_FILLED": "PARTIALLY_FILLED", "NEW": "NEW", "OPEN": "NEW",
-              "CANCELED": "CANCELED", "CANCELLED": "CANCELED", "REJECTED": "REJECTED"}.get(raw, "UNKNOWN")
-    return {"status": status, "order_id": str(d.get("orderId", "")),
-            "executed_qty": _d(d.get("executedQuantity", d.get("executedQty", "0"))),
-            "quote_qty": _d(d.get("executedAmount", d.get("cummulativeQuoteQty", "0")))}
+def build_order_payload(symbol: str, side: str, quantity: Decimal, client_id: int,
+                        limit_price: Decimal | None = None) -> dict:
+    p = {"symbol": symbol, "timeInForce": 1, "side": 0 if side == "BUY" else 1,
+         "quantity": float(quantity), "orderType": 2 if limit_price is not None else 1,
+         "clientOrderId": int(client_id)}
+    if limit_price is not None:
+        p["limitPrice"] = float(limit_price)
+    return p
 
 
-def parse_balances(data: dict) -> dict[str, Decimal]:
-    """UNVERIFIED. Expects data = [{"asset"/"currency": "BTC", "available": "0.1"}, ...]."""
-    rows = data.get("data") or []
-    out = {}
-    for r in rows if isinstance(rows, list) else []:
-        asset = r.get("asset") or r.get("currency") or r.get("symbol")
-        if asset:
-            out[str(asset).upper()] = _d(r.get("available", r.get("free", "0")))
-    return out
+_STATES = {"0": "UNKNOWN", "UNKNOWN": "UNKNOWN", "1": "WORKING", "WORKING": "WORKING",
+           "2": "REJECTED", "REJECTED": "REJECTED", "3": "CANCELED", "CANCELED": "CANCELED",
+           "CANCELLED": "CANCELED", "4": "EXPIRED", "EXPIRED": "EXPIRED",
+           "5": "FULLYEXECUTED", "FULLYEXECUTED": "FULLYEXECUTED"}
+
+
+def parse_order_row(row: dict) -> dict:
+    """The docs list numeric states but their examples show names ("Working", "FullyExecuted"): accept both.
+    Returns status (FILLED | PARTIALLY_FILLED | WORKING | CANCELED | EXPIRED | REJECTED | UNKNOWN), working,
+    order_id, executed_qty, quote_qty, note."""
+    raw = str(row.get("orderState", "")).strip().upper().replace(" ", "").replace("_", "")
+    state = _STATES.get(raw, "UNKNOWN")
+    executed = _d(row.get("quantityExecuted", "0") or "0")
+    avg = _d(row.get("avgPrice", "0") or "0")
+    status = {"FULLYEXECUTED": "FILLED", "WORKING": "WORKING", "CANCELED": "CANCELED", "EXPIRED": "EXPIRED",
+              "REJECTED": "REJECTED"}.get(state, "UNKNOWN")
+    if status in ("WORKING", "CANCELED", "EXPIRED") and executed > 0:
+        status = "PARTIALLY_FILLED"
+    return {"status": status, "working": state == "WORKING", "order_id": str(row.get("orderId", "")),
+            "executed_qty": executed, "quote_qty": executed * avg,
+            "note": str(row.get("rejectReason") or row.get("cancelReason") or "")}
 
 
 # --- order flow --------------------------------------------------------------------
@@ -198,7 +273,7 @@ def status() -> dict:
     """What the UI should show before anyone presses a button."""
     ad = InnovestXExec()
     return {"enabled": exec_enabled(), "allow_live": allow_live(), "configured": ad.configured(),
-            "order_path_set": bool(ad.path("ORDER")), "killed": is_killed(),
+            "killed": is_killed(), "order_type": order_type(), "slippage_pct": slippage_pct(),
             "max_order": max_order_thb(), "max_daily": max_daily_thb(), "used_today": daily_notional_thb()}
 
 
@@ -208,8 +283,6 @@ def _live_blockers(ad: InnovestXExec) -> list[str]:
         out.append("EXEC_ENABLED is off")
     if not allow_live():
         out.append("INVX_ALLOW_LIVE is off")
-    if not ad.path("ORDER"):
-        out.append("INVX_ORDER_PATH is not set")
     if not ad.configured():
         out.append("API keys are not set")
     return out
@@ -230,8 +303,8 @@ def reconcile(side: str, base: str, before: dict, after: dict, executed: Decimal
 
 
 def place_order(symbol: str, side: str, quantity, ref_price, adapter: InnovestXExec | None = None) -> InvxResult:
-    """Place an order for `quantity` coins. `ref_price` = the app's current ask (BUY) / bid (SELL),
-    used only to size the order against the THB limits. Dry-run unless every live gate is open."""
+    """Place an order for `quantity` coins. `ref_price` = the app's current ask (BUY) / bid (SELL): it sizes
+    the order against the THB limits and sets the limit price. Dry-run unless every live gate is open."""
     init_exec_db()
     side = side.upper()
     if side not in ("BUY", "SELL"):
@@ -244,43 +317,71 @@ def place_order(symbol: str, side: str, quantity, ref_price, adapter: InnovestXE
     if is_killed():
         raise ExecutionError("Kill switch is ON: no orders can be placed.")
     ad = adapter or InnovestXExec()
-    notional = qty * price
+    blockers = _live_blockers(ad)
+    live = not blockers
     base = symbol[:-3]
+    notes = []
+
+    rules = None                                           # round to the exchange's increments
+    if ad.configured():
+        try:
+            rules = ad.rules(symbol)
+        except ExecutionError as e:
+            if live:
+                raise ExecutionError(f"Cannot read the symbol rules: {e}") from e
+            notes.append(f"rules not checked ({e})")
+    else:
+        notes.append("increments not checked (no keys)")
+    if rules:
+        qty = _round_to(qty, rules.qty_inc, ROUND_DOWN)
+        if qty <= 0:
+            raise ExecutionError(f"Quantity is below the minimum increment {_fmt(rules.qty_inc)} {base}.")
+    limit = None
+    if order_type() == "LIMIT":
+        tol = slippage_pct() / 100
+        limit = price * (1 + tol) if side == "BUY" else price * (1 - tol)
+        limit = _round_to(limit, rules.price_inc, ROUND_DOWN if side == "BUY" else ROUND_UP) if rules else limit.quantize(Decimal("0.01"))
+
+    notional = qty * price
     if notional > max_order_thb():
         raise ExecutionError(f"Order value ฿{_fmt(notional.quantize(Decimal('0.01')))} exceeds the per-order "
                              f"limit ฿{_fmt(max_order_thb())}.")
-    blockers = _live_blockers(ad)
-    live = not blockers
     if live and daily_notional_thb() + notional > max_daily_thb():
         raise ExecutionError(f"This order would pass the daily limit of ฿{_fmt(max_daily_thb())} "
                              f"(used today: ฿{_fmt(daily_notional_thb().quantize(Decimal('0.01')))}).")
     requested = f"{side.lower()} {_fmt(qty)} {base} @~{_fmt(price)}"
-    client_id = "cm-" + uuid.uuid4().hex[:24]
-    payload = build_order_payload(symbol, side, qty, client_id)
+    cid = new_client_id()
+    payload = build_order_payload(symbol, side, qty, cid, limit)
     result = InvxResult(mode=LIVE_MODE if live else DRY_MODE, status="", symbol=symbol, side=side,
-                        client_order_id=client_id)
+                        client_order_id=str(cid))
 
     if not live:                                           # ---- dry-run: nothing leaves this machine
         result.status = "DRY_RUN"
-        result.note = "Not sent: " + "; ".join(blockers) + f". Payload: {json.dumps(payload)}"
+        result.note = ("Not sent: " + "; ".join(blockers) + f". Payload: {json.dumps(payload)}"
+                       + (f" ({'; '.join(notes)})" if notes else ""))
         result.row_id = _insert(mode=DRY_MODE, symbol=symbol, side=side, requested=requested,
-                                notional_quote=float(notional), client_order_id=client_id,
+                                notional_quote=float(notional), client_order_id=str(cid),
                                 status=result.status, note=result.note)
         return result
 
     before = ad.balances()                                 # ---- live
-    need_asset, need = ("THB", notional) if side == "BUY" else (base, qty)
+    need_asset, need = ("THB", qty * (limit or price)) if side == "BUY" else (base, qty)
     if before.get(need_asset, Decimal(0)) < need:
         raise ExecutionError(f"Not enough {need_asset} on InnovestX "
                              f"(have {_fmt(before.get(need_asset, Decimal(0)))}, need {_fmt(need)}).")
     result.row_id = _insert(mode=LIVE_MODE, symbol=symbol, side=side, requested=requested,   # write-ahead
-                            notional_quote=float(notional), client_order_id=client_id, status="SENDING")
+                            notional_quote=float(notional), client_order_id=str(cid), status="SENDING")
     parsed = None
     try:
-        parsed = parse_order_response(ad.new_order(payload))
+        sent = ad.new_order(payload)
+        result.order_id = str((sent.get("data") or {}).get("orderId", ""))
+        parsed = _settle(ad, symbol, cid, result)
+        if parsed is None:
+            result.status = "UNKNOWN"
+            result.note = "Order was accepted but its status is not visible yet. Check InnovestX before trying again."
     except StatusUnknown as e:
         result.warnings.append(f"Unclear reply ({e}); checking the order by its client id.")
-        parsed = _resolve(ad, symbol, client_id)
+        parsed = _settle(ad, symbol, cid, result)
         if parsed is None:
             result.status = "UNKNOWN"
             result.note = "Could not confirm whether the order exists. Check InnovestX before trying again."
@@ -290,11 +391,13 @@ def place_order(symbol: str, side: str, quantity, ref_price, adapter: InnovestXE
         _update(result.row_id, status="ERROR", note=f"{type(e).__name__}: {e}")
         raise
     if parsed is not None:
-        result.status, result.order_id = parsed["status"], parsed["order_id"]
+        result.status = parsed["status"]
+        result.order_id = parsed["order_id"] or result.order_id
         result.executed_qty, result.quote_qty = parsed["executed_qty"], parsed["quote_qty"]
+        result.note = parsed["note"] or result.note
         if result.executed_qty > 0 and result.quote_qty > 0:
             result.avg_price = result.quote_qty / result.executed_qty
-        if result.status in ("FILLED", "PARTIALLY_FILLED"):
+        if result.executed_qty > 0:
             try:
                 result.reconcile = reconcile(side, base, before, ad.balances(), result.executed_qty, result.quote_qty)
             except ExecutionError as e:
@@ -306,16 +409,32 @@ def place_order(symbol: str, side: str, quantity, ref_price, adapter: InnovestXE
     return result
 
 
-def _resolve(ad: InnovestXExec, symbol: str, client_id: str, tries: int = 3):
-    """Ask InnovestX about our order by client id. None = still unclear (stays UNKNOWN)."""
-    if not ad.path("ORDER_STATUS"):
-        return None
+def _poll(ad: InnovestXExec, symbol: str, cid: int, tries: int = 3):
+    """Read our order back by client id. Returns the last parsed row (maybe still working) or None."""
+    last = None
     for i in range(tries):
-        _sleep(1.0 * (i + 1))
+        if i:
+            _sleep(float(i))
         try:
-            parsed = parse_order_response(ad.get_order(symbol, client_id))
-            if parsed["status"] != "UNKNOWN":
-                return parsed
+            row = ad.get_order(symbol, cid)
         except ExecutionError:
-            pass
-    return None
+            row = None
+        if row:
+            last = parse_order_row(row)
+            if not last["working"] and last["status"] != "UNKNOWN":
+                return last
+    return last
+
+
+def _settle(ad: InnovestXExec, symbol: str, cid: int, result: InvxResult):
+    """Poll until the order is final. GTC is the only time-in-force, so anything still working is cancelled."""
+    parsed = _poll(ad, symbol, cid)
+    if parsed is None or not parsed["working"]:
+        return parsed
+    try:
+        ad.cancel_order(cid)
+        result.warnings.append("Part of the order was still open, so it was cancelled.")
+    except (ExecutionError, StatusUnknown) as e:
+        result.warnings.append(f"Order is still open and the cancel failed ({e}). Cancel it on InnovestX now.")
+        return parsed
+    return _poll(ad, symbol, cid) or parsed
