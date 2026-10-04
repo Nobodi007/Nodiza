@@ -109,7 +109,10 @@ def buy(quote: Quote, thb: float) -> float:
     """Spend `thb` on this exchange. Returns the coins received."""
     if thb <= 0:
         raise OrderError("Enter an amount greater than zero.")
-    coins, fee = quote.buy(thb)
+    try:
+        coins, fee = quote.buy(thb)
+    except ValueError as e:
+        raise OrderError(str(e)) from e
     coins = math.floor(coins * 1e8) / 1e8          # exchanges trade in 8 decimals
     asset = quote.symbol.split("/")[0]
     with db() as conn:
@@ -118,7 +121,7 @@ def buy(quote: Quote, thb: float) -> float:
             raise OrderError(f"Not enough THB. You have ฿{have:,.2f}.")
         _adjust(conn, "THB", -thb)
         _adjust(conn, asset, coins)
-        _record(conn, quote, "Buy", coins, quote.ask, fee, thb)
+        _record(conn, quote, "Buy", coins, thb * (1 - quote.fee_rate) / coins if coins else quote.ask, fee, thb)
     return coins
 
 
@@ -133,8 +136,11 @@ def sell(quote: Quote, coins: float) -> float:
             coins = have
         if coins > have:
             raise OrderError(f"Not enough {asset}. You have {have:.8f}.")
-        thb, fee = quote.sell(coins)
+        try:
+            thb, fee = quote.sell(coins)
+        except ValueError as e:
+            raise OrderError(str(e)) from e
         _adjust(conn, asset, -coins)
         _adjust(conn, "THB", thb)
-        _record(conn, quote, "Sell", coins, quote.bid, fee, thb)
+        _record(conn, quote, "Sell", coins, (thb + fee) / coins if coins else quote.bid, fee, thb)
     return thb
