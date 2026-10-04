@@ -62,6 +62,11 @@ def init_db() -> None:
                    total_thb REAL NOT NULL,
                    status TEXT NOT NULL)"""
         )
+        # Migration: older databases lack the execution-quality columns.
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+        for col in ("ref_price", "latency_ms"):
+            if col not in existing:
+                conn.execute(f"ALTER TABLE orders ADD COLUMN {col} REAL NOT NULL DEFAULT 0")
         for asset in ASSETS:
             start = START_THB if asset == "THB" else 0.0
             conn.execute("INSERT OR IGNORE INTO balances (asset, amount) VALUES (?, ?)", (asset, start))
@@ -96,11 +101,14 @@ def _adjust(conn, asset: str, delta: float) -> None:
 
 
 def _record(conn, quote: Quote, side: str, coins: float, price: float, fee: float, total_thb: float) -> None:
+    ref = quote.ask if side == "Buy" else quote.bid     # top of book when the quote was taken
     conn.execute(
-        """INSERT INTO orders (created_at, symbol, side, exchange, coins, price, fee_thb, total_thb, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO orders (created_at, symbol, side, exchange, coins, price, fee_thb, total_thb, status,
+                               ref_price, latency_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), quote.symbol, side, quote.exchange,
-         coins, price, fee, total_thb, "Filled (paper)" if quote.live else "Filled (mock)"),
+         coins, price, fee, total_thb, "Filled (paper)" if quote.live else "Filled (mock)",
+         ref, quote.latency_ms),
     )
 
 
