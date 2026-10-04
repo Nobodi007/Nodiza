@@ -84,8 +84,16 @@ with trade_tab:
         hide_index=True, width="stretch",
     )
 
+    with st.expander(f"Order Book & Liquidity — {symbol}", expanded=True):
+        depth_exchange = st.selectbox("View depth", [q.exchange for q in quotes], key=f"depth_{symbol}")
+        depth_q = by_name[depth_exchange]
+        depth_rows = ([{"Side": "ASK", "Price (THB)": px, "Quantity": qty} for px, qty in depth_q.asks]
+                      + [{"Side": "BID", "Price (THB)": px, "Quantity": qty} for px, qty in depth_q.bids])
+        st.dataframe(pd.DataFrame(depth_rows), hide_index=True, width="stretch")
+        st.caption("Order Book เป็นข้อมูลจำลอง 5 ระดับราคา; การซื้อขายจะไล่กินสภาพคล่องตามระดับราคาและบันทึกราคาเฉลี่ยถ่วงน้ำหนัก")
+
     st.subheader("Smart Order Routing (Mock)")
-    st.caption("ระบบเลือก Exchange ที่ให้ผลลัพธ์สุทธิดีที่สุดจากราคาและค่าธรรมเนียมที่มีอยู่ใน Mock quotes")
+    st.caption("ระบบเลือกจากราคา top-of-book หลังค่าธรรมเนียม; การ Fill จะคำนวณตาม depth จริงใน mock book และอาจมี slippage")
 
     route_buy_col, route_sell_col = st.columns(2)
     with route_buy_col:
