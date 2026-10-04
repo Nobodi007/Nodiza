@@ -41,6 +41,9 @@ class Quote:
     ts: float = field(default_factory=time.time)  # when the quote was fetched
     live: bool = False                            # True = real market data
     latency_ms: float = 0.0                       # time to fetch this quote
+    fee_source: str = "mock"   # where fee_rate came from: "live" | "env" | "default" | "placeholder" | "mock"
+    fee_note: str = ""         # human-readable detail about the fee (shown in the app)
+    error: str = ""            # why a live venue fell back to a mock quote (empty otherwise)
 
     @property
     def spread(self) -> float:
@@ -203,8 +206,28 @@ class RealExchange(Exchange):
     def _headers(self) -> dict:
         return {}
 
+    fee_source = "default"   # "default" | "env" | "live": where the fee used last came from
+    fee_note = ""
+
     def _fee_rate(self, symbol: str) -> float:
-        """Fee used for this quote. Adapters that can look up their real fee override this."""
+        """Fee used for this quote. <NAME>_FEE_RATE (e.g. BITKUB_FEE_RATE=0.0025, BINANCE_TH_FEE_RATE,
+        MAXBIT_FEE_RATE) overrides the built-in value, as a fraction (0.0025 = 0.25%), so you can put your
+        own account's tier fee in .env / Secrets without editing code. Adapters that can look up their
+        real fee (InnovestX) override this method."""
+        var = self.name.upper().replace(" ", "_") + "_FEE_RATE"
+        raw = _secret(var)
+        if raw:
+            try:
+                rate = float(raw)
+                if 0 <= rate <= 0.02:
+                    self.fee_source, self.fee_note = "env", f"{var}={raw}"
+                    return rate
+                self.fee_note = f"{var}={raw} ignored (must be a fraction between 0 and 0.02, e.g. 0.0025)"
+            except ValueError:
+                self.fee_note = f"{var}={raw!r} ignored (not a number)"
+        else:
+            self.fee_note = ""
+        self.fee_source = "default"
         return self.fee_rate
 
     def _fetch(self, url: str, params: dict):
@@ -248,9 +271,10 @@ class RealExchange(Exchange):
             if not asks or not bids:
                 raise ValueError("empty order book")
             self.last_error = None
+            fee = self._fee_rate(symbol)          # sets self.fee_source / self.fee_note
             quote = Quote(self.name, symbol, bid=bids[0][0], ask=asks[0][0],
-                         fee_rate=self._fee_rate(symbol), asks=asks, bids=bids, live=True,
-                         latency_ms=latency_ms)
+                         fee_rate=fee, asks=asks, bids=bids, live=True,
+                         latency_ms=latency_ms, fee_source=self.fee_source, fee_note=self.fee_note)
             with _CACHE_LOCK:
                 _CACHE[key] = (time.time(), quote)
             return quote
@@ -260,6 +284,7 @@ class RealExchange(Exchange):
                 raise
             q = self.fallback.get_price(symbol)
             q.exchange = f"{self.name} (mock fallback)"
+            q.fee_source, q.fee_note, q.error = "mock", "simulated fallback fee", self.last_error or ""
             return q
 
 
