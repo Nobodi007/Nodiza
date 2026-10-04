@@ -63,6 +63,7 @@ trade_tab, portfolio_tab, history_tab = st.tabs(["Trade", "Portfolio", "Order hi
 
 # --- Trade ------------------------------------------------------------------
 with trade_tab:
+    # Top-of-book leaders are useful reference points; routing below is sized.
     best_buy = min(quotes, key=lambda q: q.effective_buy_price)
     best_sell = max(quotes, key=lambda q: q.effective_sell_price)
     c1, c2 = st.columns(2)
@@ -93,7 +94,27 @@ with trade_tab:
         st.caption("Order Book เป็นข้อมูลจำลอง 5 ระดับราคา; การซื้อขายจะไล่กินสภาพคล่องตามระดับราคาและบันทึกราคาเฉลี่ยถ่วงน้ำหนัก")
 
     st.subheader("Smart Order Routing (Mock)")
-    st.caption("ระบบเลือกจากราคา top-of-book หลังค่าธรรมเนียม; การ Fill จะคำนวณตาม depth จริงใน mock book และอาจมี slippage")
+    st.caption("ระบบเปรียบเทียบผลลัพธ์ของคำสั่งขนาดที่ระบุ โดยรวม depth และค่าธรรมเนียมจากสมุดคำสั่งจำลอง")
+
+    def rank_buy(thb_amount):
+        ranked = []
+        for q in quotes:
+            try:
+                received, fee = q.buy(thb_amount)
+                ranked.append((received, q, fee))
+            except ValueError:
+                continue
+        return max(ranked, key=lambda row: row[0]) if ranked else None
+
+    def rank_sell(coin_amount):
+        ranked = []
+        for q in quotes:
+            try:
+                proceeds, fee = q.sell(coin_amount)
+                ranked.append((proceeds, q, fee))
+            except ValueError:
+                continue
+        return max(ranked, key=lambda row: row[0]) if ranked else None
 
     route_buy_col, route_sell_col = st.columns(2)
     with route_buy_col:
@@ -101,13 +122,19 @@ with trade_tab:
             "Auto Buy amount (THB)", min_value=0.0, value=50_000.0,
             step=1_000.0, key=f"route_buy_thb_{symbol}"
         )
-        route_coins, route_fee = best_buy.buy(route_thb) if route_thb > 0 else (0.0, 0.0)
-        st.write(f"Best route: **{best_buy.exchange}**")
-        st.caption(f"ประมาณ {route_coins:.8f} {coin} หลังหักค่าธรรมเนียม")
-        if st.button(f"Auto Buy {coin}", type="primary", disabled=not (0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
+        buy_route = rank_buy(route_thb) if route_thb > 0 else None
+        buy_quote = buy_route[1] if buy_route else None
+        route_coins = buy_route[0] if buy_route else 0.0
+        route_fee = buy_route[2] if buy_route else 0.0
+        if buy_quote:
+            st.write(f"Best route for ฿{route_thb:,.2f}: **{buy_quote.exchange}**")
+            st.caption(f"ประมาณ {route_coins:.8f} {coin} หลังหักค่าธรรมเนียม | Fee ฿{route_fee:,.2f}")
+        else:
+            st.warning("ไม่มี Exchange ที่มี Ask liquidity เพียงพอสำหรับยอดนี้")
+        if st.button(f"Auto Buy {coin}", type="primary", disabled=not (buy_quote and 0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
             try:
-                received = portfolio.buy(best_buy, route_thb)
-                st.session_state.flash = f"Auto-routed buy: {received:.8f} {coin} via {best_buy.exchange}."
+                received = portfolio.buy(buy_quote, route_thb)
+                st.session_state.flash = f"Auto-routed buy: {received:.8f} {coin} via {buy_quote.exchange}."
                 st.rerun()
             except portfolio.OrderError as e:
                 st.error(str(e))
@@ -119,13 +146,19 @@ with trade_tab:
             value=math.floor(route_held * 1e8) / 1e8,
             step=0.001, format="%.8f", key=f"route_sell_amount_{symbol}"
         )
-        route_proceeds, route_sell_fee = best_sell.sell(route_sell_amount) if route_sell_amount > 0 else (0.0, 0.0)
-        st.write(f"Best route: **{best_sell.exchange}**")
-        st.caption(f"ประมาณรับ ฿{route_proceeds:,.2f} หลังหักค่าธรรมเนียม")
-        if st.button(f"Auto Sell {coin}", type="primary", disabled=not (0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
+        sell_route = rank_sell(route_sell_amount) if route_sell_amount > 0 else None
+        sell_quote = sell_route[1] if sell_route else None
+        route_proceeds = sell_route[0] if sell_route else 0.0
+        route_sell_fee = sell_route[2] if sell_route else 0.0
+        if sell_quote:
+            st.write(f"Best route for {route_sell_amount:.8f} {coin}: **{sell_quote.exchange}**")
+            st.caption(f"ประมาณรับ ฿{route_proceeds:,.2f} หลังหักค่าธรรมเนียม | Fee ฿{route_sell_fee:,.2f}")
+        else:
+            st.warning("ไม่มี Exchange ที่มี Bid liquidity เพียงพอสำหรับจำนวนนี้")
+        if st.button(f"Auto Sell {coin}", type="primary", disabled=not (sell_quote and 0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
             try:
-                received_thb = portfolio.sell(best_sell, route_sell_amount)
-                st.session_state.flash = f"Auto-routed sell via {best_sell.exchange}: ฿{received_thb:,.2f}."
+                received_thb = portfolio.sell(sell_quote, route_sell_amount)
+                st.session_state.flash = f"Auto-routed sell via {sell_quote.exchange}: ฿{received_thb:,.2f}."
                 st.rerun()
             except portfolio.OrderError as e:
                 st.error(str(e))
