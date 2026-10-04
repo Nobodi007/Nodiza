@@ -222,3 +222,25 @@ def test_innovestx_sends_key_header_only(monkeypatch):
     finally:
         os.environ.pop("MAXBIT_API_KEY", None)
     assert q.live and seen["headers"] == {"X-MBX-APIKEY": "dummy-test-key"}
+
+
+def test_unconfigured_live_venues_are_left_out(monkeypatch):
+    import os
+    for v in ("MAXBIT_API_KEY", "INNOVESTX_API_KEY", "INNOVESTX_BASE_URL"):
+        os.environ.pop(v, None)
+    names = [e.name for e in exchanges.build_exchanges("Live data")]
+    assert names == ["Bitkub", "Binance TH"]
+
+
+def test_innovestx_needs_key_and_base_url(monkeypatch):
+    import os
+    os.environ["INNOVESTX_API_KEY"] = "k"
+    try:
+        assert not exchanges.InnovestXExchange().configured()
+        os.environ["INNOVESTX_BASE_URL"] = "https://example.invalid/"
+        ex = exchanges.InnovestXExchange()
+        assert ex.configured()
+        assert ex._params("BTC/THB")[0] == "https://example.invalid/api/v1/depth"
+    finally:
+        os.environ.pop("INNOVESTX_API_KEY", None)
+        os.environ.pop("INNOVESTX_BASE_URL", None)
