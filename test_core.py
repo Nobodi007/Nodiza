@@ -226,21 +226,73 @@ def test_innovestx_sends_key_header_only(monkeypatch):
 
 def test_unconfigured_live_venues_are_left_out(monkeypatch):
     import os
-    for v in ("MAXBIT_API_KEY", "INNOVESTX_API_KEY", "INNOVESTX_BASE_URL"):
+    for v in ("MAXBIT_API_KEY", "INNOVESTX_API_KEY", "INNOVESTX_API_SECRET"):
         os.environ.pop(v, None)
     names = [e.name for e in exchanges.build_exchanges("Live data")]
     assert names == ["Bitkub", "Binance TH"]
 
 
-def test_innovestx_needs_key_and_base_url(monkeypatch):
+def _clear_invx():
     import os
-    os.environ["INNOVESTX_API_KEY"] = "k"
+    for v in ("INNOVESTX_API_KEY", "INNOVESTX_API_SECRET", "INNOVESTX_BASE_URL", "INNOVESTX_DEPTH_PATH"):
+        os.environ.pop(v, None)
+
+
+def test_innovestx_needs_key_and_secret():
+    import os
+    _clear_invx()
     try:
+        os.environ["INNOVESTX_API_KEY"] = "k"
         assert not exchanges.InnovestXExchange().configured()
-        os.environ["INNOVESTX_BASE_URL"] = "https://example.invalid/"
+        os.environ["INNOVESTX_API_SECRET"] = "s"
         ex = exchanges.InnovestXExchange()
         assert ex.configured()
-        assert ex._params("BTC/THB")[0] == "https://example.invalid/api/v1/depth"
+        url, body = ex._params("BTC/THB")
+        assert url == "https://api.innovestxonline.com/api/v1/digital-asset/orderbook/lvl2"
+        assert body["symbol"] == "BTCTHB"
     finally:
-        os.environ.pop("INNOVESTX_API_KEY", None)
-        os.environ.pop("INNOVESTX_BASE_URL", None)
+        _clear_invx()
+
+
+INVX_BOOK = {"code": "0000", "message": "SUCCESS", "data": [
+    {"actionType": 0, "price": "99", "quantity": "1", "side": 0},
+    {"actionType": 0, "price": "98", "quantity": "1", "side": 0},
+    {"actionType": 0, "price": "101", "quantity": "2", "side": 1},
+    {"actionType": 0, "price": "102", "quantity": "1", "side": 1},
+    {"actionType": 2, "price": "100", "quantity": "9", "side": 1}]}      # deletion: must be ignored
+
+
+def test_innovestx_signs_post_and_parses_book(monkeypatch):
+    import os, hmac, hashlib, json
+    _clear_invx()
+    os.environ["INNOVESTX_API_KEY"], os.environ["INNOVESTX_API_SECRET"] = "mykey", "mysecret"
+    seen = {}
+    def fake_post(url, data=None, headers=None, timeout=None):
+        seen.update(url=url, data=data, headers=headers)
+        return FakeResp(INVX_BOOK)
+    monkeypatch.setattr(exchanges.requests, "post", fake_post)
+    try:
+        q = exchanges.InnovestXExchange().get_price("BTC/THB")
+    finally:
+        _clear_invx()
+    assert (q.live, q.bid, q.ask) == (True, 99, 101) and len(q.asks) == 2
+    h = seen["headers"]
+    assert json.loads(seen["data"]) == {"symbol": "BTCTHB", "depth": 100}
+    to_sign = ("mykey" + "POST" + "api.innovestxonline.com" + "/api/v1/digital-asset/orderbook/lvl2" + ""
+               + "application/json" + h["X-INVX-REQUEST-UID"] + h["X-INVX-TIMESTAMP"] + seen["data"])
+    assert h["X-INVX-SIGNATURE"] == hmac.new(b"mysecret", to_sign.encode(), hashlib.sha256).hexdigest()
+    assert "mysecret" not in json.dumps(h)                          # secret signs, never travels
+
+
+def test_innovestx_error_code_falls_back_with_reason(monkeypatch):
+    import os
+    _clear_invx()
+    os.environ["INNOVESTX_API_KEY"], os.environ["INNOVESTX_API_SECRET"] = "k", "s"
+    monkeypatch.setattr(exchanges.requests, "post",
+                        lambda *a, **k: FakeResp({"code": "4003", "message": "Invalid IP Whitelist"}))
+    try:
+        ex = exchanges.InnovestXExchange(fallback=MockExchange("InnovestX", 0.0025, 0.001, 0.0))
+        q = ex.get_price("BTC/THB")
+    finally:
+        _clear_invx()
+    assert "mock fallback" in q.exchange and "4003" in ex.last_error and "whitelist" in ex.last_error.lower()
