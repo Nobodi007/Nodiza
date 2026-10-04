@@ -153,6 +153,16 @@ def _load_env() -> None:
 
 _load_env()
 
+
+def _streamlit_secret(name: str) -> str:
+    """Streamlit Community Cloud keeps secrets in st.secrets (Settings > Secrets), not in .env."""
+    try:
+        import streamlit as st
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:
+        return ""
+
+
 _CACHE: dict[tuple[str, str], tuple[float, "Quote"]] = {}
 _CACHE_LOCK = threading.Lock()
 CACHE_TTL = 2.0  # seconds: stops rapid "Refresh" clicks from hammering public APIs
@@ -264,9 +274,9 @@ class InnovestXExchange(RealExchange):
     PATH = "/api/v1/depth"
 
     def _headers(self):
-        key = os.environ.get("INNOVESTX_API_KEY", "").strip()
+        key = os.environ.get("INNOVESTX_API_KEY", "").strip() or _streamlit_secret("INNOVESTX_API_KEY")
         if not key:
-            raise RuntimeError(f"INNOVESTX_API_KEY is not set. Looked for: {', '.join(str(p) for p in ENV_PATHS)}")
+            raise RuntimeError("INNOVESTX_API_KEY is not set (local: .env file; Streamlit Cloud: app Settings > Secrets)")
         return {"X-MBX-APIKEY": key}
 
     def _params(self, symbol):
