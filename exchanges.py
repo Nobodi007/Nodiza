@@ -220,6 +220,7 @@ class RealExchange(Exchange):
         if hit and time.time() - hit[0] < CACHE_TTL:
             self.last_error = None
             return hit[1]
+        url = "?"
         try:
             url, params = self._params(symbol)
             t0 = time.perf_counter()
@@ -240,7 +241,7 @@ class RealExchange(Exchange):
                 _CACHE[key] = (time.time(), quote)
             return quote
         except Exception as e:                             # network, JSON, parsing...
-            self.last_error = f"{type(e).__name__}: {e}{getattr(self, 'debug_note', '')}"
+            self.last_error = f"{type(e).__name__}: {e} [GET {url}]{getattr(self, 'debug_note', '')}"
             if self.fallback is None:
                 raise
             q = self.fallback.get_price(symbol)
@@ -312,10 +313,26 @@ class InnovestXExchange(MaxbitExchange):
     def configured(self):
         return bool(_secret(self.KEY_VAR) and _secret("INNOVESTX_BASE_URL"))
 
+    def _headers(self):
+        """Header name via INNOVESTX_HEADER (default X-MBX-APIKEY).
+        Use e.g. INNOVESTX_HEADER=Authorization together with INNOVESTX_AUTH_PREFIX=Bearer."""
+        key = _secret(self.KEY_VAR)
+        if not key:
+            raise RuntimeError(f"{self.KEY_VAR} is not set")
+        self.debug_note = f" [key length sent: {len(key)}]"
+        name = _secret("INNOVESTX_HEADER") or "X-MBX-APIKEY"
+        prefix = _secret("INNOVESTX_AUTH_PREFIX")
+        return {name: f"{prefix} {key}" if prefix else key}
+
     def _params(self, symbol):
+        """Symbol format via INNOVESTX_SYMBOL_FMT, default {base}THB. Placeholders: {base} {quote}
+        (BASE/QUOTE upper case; use {base_l} {quote_l} for lower case). Example: {base}_{quote}"""
+        base, quote = symbol.split("/")
+        fmt = _secret("INNOVESTX_SYMBOL_FMT") or "{base}{quote}"
+        sym = fmt.format(base=base.upper(), quote=quote.upper(), base_l=base.lower(), quote_l=quote.lower())
         base_url = _secret("INNOVESTX_BASE_URL").rstrip("/")
         path = _secret("INNOVESTX_DEPTH_PATH") or "/api/v1/depth"
-        return base_url + path, {"symbol": f"{symbol.split('/')[0].upper()}THB", "limit": 20}
+        return base_url + path, {"symbol": sym, "limit": 20}
 
 
 def build_exchanges(mode: str = "Mock") -> list[Exchange]:
