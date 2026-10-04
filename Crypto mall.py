@@ -3,6 +3,7 @@
 Run with:  streamlit run app.py
 """
 import math
+import time
 
 import pandas as pd
 import streamlit as st
@@ -43,6 +44,10 @@ for s in SYMBOLS:
     if s not in st.session_state.quotes:
         st.session_state.quotes[s] = [ex.get_price(s) for ex in EXCHANGES]
 
+STALE_AFTER = 30  # seconds; live quotes older than this can't be traded
+quote_age = time.time() - min(q.ts for q in st.session_state.quotes[symbol])
+stale = mode == "Live data" and quote_age > STALE_AFTER
+
 errors = [f"{ex.name}: {ex.last_error}" for ex in EXCHANGES if getattr(ex, "last_error", None)]
 
 quotes = st.session_state.quotes[symbol]
@@ -61,6 +66,9 @@ else:
     st.caption("Live data: real order books, paper money only. No orders are sent to any exchange.")
     if errors:
         st.warning("Some exchanges fell back to mock prices:\n\n" + "\n\n".join(errors))
+    st.caption(f"Prices fetched {quote_age:.0f}s ago.")
+    if stale:
+        st.error(f"Prices are older than {STALE_AFTER}s. Press 'Refresh prices' before placing an order.")
 
 best_bids = {a: max(q.bid for q in st.session_state.quotes[f"{a}/THB"]) for a in ("BTC", "ETH")}
 total_value = balances["THB"] + sum(balances[a] * best_bids[a] for a in best_bids)
@@ -191,7 +199,7 @@ with trade_tab:
         else:
             buy_legs = []
             st.warning("สภาพคล่อง Ask รวมของทุก Exchange ไม่เพียงพอสำหรับยอดนี้")
-        if st.button(f"Auto Buy {coin}", type="primary", disabled=not (buy_route and 0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
+        if st.button(f"Auto Buy {coin}", type="primary", disabled=stale or not (buy_route and 0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
             try:
                 received = portfolio.buy_split(buy_legs)
                 st.session_state.flash = f"Split-routed buy: {received:.8f} {coin} across {len(buy_legs)} exchange(s)."
@@ -229,7 +237,7 @@ with trade_tab:
         else:
             sell_legs = []
             st.warning("สภาพคล่อง Bid รวมของทุก Exchange ไม่เพียงพอสำหรับจำนวนนี้")
-        if st.button(f"Auto Sell {coin}", type="primary", disabled=not (sell_route and 0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
+        if st.button(f"Auto Sell {coin}", type="primary", disabled=stale or not (sell_route and 0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
             try:
                 received_thb = portfolio.sell_split(sell_legs)
                 st.session_state.flash = f"Split-routed sell across {len(sell_legs)} exchange(s): ฿{received_thb:,.2f}."
@@ -251,7 +259,7 @@ with trade_tab:
         enough = 0 < thb <= balances["THB"]
         if thb > balances["THB"]:
             st.warning(f"Not enough THB. You have ฿{balances['THB']:,.2f}.")
-        if st.button(f"Confirm buy {coin}", type="primary", disabled=not enough):
+        if st.button(f"Confirm buy {coin}", type="primary", disabled=stale or not enough):
             try:
                 coins = portfolio.buy(by_name[buy_ex], thb)
                 st.session_state.flash = f"Bought {coins:.8f} {coin} on {buy_ex}."
@@ -272,7 +280,7 @@ with trade_tab:
         if amount > held + 1e-8:
             st.warning(f"Not enough {coin}.")
         can_sell = 0 < amount <= held + 1e-8
-        if st.button(f"Confirm sell {coin}", type="primary", disabled=not can_sell):
+        if st.button(f"Confirm sell {coin}", type="primary", disabled=stale or not can_sell):
             try:
                 thb_back = portfolio.sell(by_name[sell_ex], amount)
                 st.session_state.flash = f"Sold {amount:.8f} {coin} on {sell_ex} for ฿{thb_back:,.2f}."
