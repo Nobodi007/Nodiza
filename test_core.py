@@ -376,3 +376,41 @@ def test_innovestx_fee_env_override(monkeypatch):
         _clear_invx()
         os.environ.pop("INNOVESTX_FEE_RATE", None)
     assert q.fee_rate == 0.0018 and not any(c.endswith("/symbol/fee/tier") for c in calls)
+
+
+# --- Per-venue fee override ----------------------------------------------
+def test_fee_env_override_for_bitkub(monkeypatch):
+    import os
+    data = {"result": {"asks": [[101, 1]], "bids": [[99, 1]]}}
+    monkeypatch.setattr(exchanges.requests, "get", lambda *a, **k: FakeResp(data))
+    os.environ["BITKUB_FEE_RATE"] = "0.0020"
+    try:
+        ex = BitkubExchange()
+        q = ex.get_price("BTC/THB")
+        assert q.fee_rate == 0.0020 and ex.fee_source == "env"
+        os.environ["BITKUB_FEE_RATE"] = "0.25"                       # percent typo: must be rejected
+        exchanges._CACHE.clear()
+        ex2 = BitkubExchange()
+        q2 = ex2.get_price("BTC/THB")
+        assert q2.fee_rate == 0.0025 and ex2.fee_source == "default" and "ignored" in ex2.fee_note
+    finally:
+        os.environ.pop("BITKUB_FEE_RATE", None)
+
+
+# --- Fee source / error carried on the Quote -----------------------------
+def test_live_quote_carries_fee_source(monkeypatch):
+    data = {"result": {"asks": [[101, 1]], "bids": [[99, 1]]}}
+    monkeypatch.setattr(exchanges.requests, "get", lambda *a, **k: FakeResp(data))
+    q = BitkubExchange().get_price("BTC/THB")
+    assert q.fee_source == "default" and q.error == ""
+
+
+def test_fallback_quote_carries_error_and_mock_fee_source(monkeypatch):
+    def boom(*a, **k): raise ConnectionError("down")
+    monkeypatch.setattr(exchanges.requests, "get", boom)
+    q = BitkubExchange(fallback=MockExchange("Bitkub", 0.0025, 0.001, 0.0)).get_price("BTC/THB")
+    assert q.fee_source == "mock" and "down" in q.error
+
+
+def test_mock_quote_defaults_to_mock_fee_source():
+    assert build_mock_exchanges()[0].get_price("BTC/THB").fee_source == "mock"
