@@ -12,8 +12,11 @@ V0.1 only needs get_price(). Later versions will add get_orderbook(),
 get_balance(), place_order() and cancel_order() to the same interface.
 """
 import random
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+
+import requests
 
 
 @dataclass
@@ -118,4 +121,95 @@ def build_mock_exchanges() -> list[Exchange]:
         MockExchange("Exchange A", fee_rate=0.0025, spread_pct=0.0010, price_bias=0.0),
         MockExchange("Exchange B", fee_rate=0.0015, spread_pct=0.0020, price_bias=-0.0015),
         MockExchange("Exchange C", fee_rate=0.0030, spread_pct=0.0005, price_bias=0.0025),
+    ]
+
+
+class RealExchange(Exchange):
+    """Public order-book adapter. No API key, no trading: market data only.
+
+    Subclasses set: name, fee_rate, and implement _params()/_parse().
+    If the request fails, we fall back to a MockExchange so the app keeps working.
+    """
+    fee_rate: float = 0.0025
+    timeout = 4
+    is_live = True
+
+    def __init__(self, fallback: "MockExchange | None" = None):
+        self.fallback = fallback
+        self.last_error: str | None = None
+
+    def _params(self, symbol: str) -> tuple[str, dict]:
+        raise NotImplementedError
+
+    def _parse(self, data: dict) -> tuple[list, list]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _levels(raw) -> list[tuple[float, float]]:
+        out = []
+        for row in raw:
+            if isinstance(row, dict):                      # {"price":..,"amount":..}
+                price = row.get("price") or row.get("rate")
+                qty = row.get("amount") or row.get("volume") or row.get("qty")
+            else:                                          # [price, qty]
+                price, qty = row[0], row[1]
+            out.append((float(price), float(qty)))
+        return out
+
+    def get_price(self, symbol: str) -> Quote:
+        try:
+            url, params = self._params(symbol)
+            r = requests.get(url, params=params, timeout=self.timeout)
+            r.raise_for_status()
+            raw_asks, raw_bids = self._parse(r.json())
+            asks = sorted(self._levels(raw_asks), key=lambda x: x[0])
+            bids = sorted(self._levels(raw_bids), key=lambda x: -x[0])
+            if not asks or not bids:
+                raise ValueError("empty order book")
+            self.last_error = None
+            return Quote(self.name, symbol, bid=bids[0][0], ask=asks[0][0],
+                         fee_rate=self.fee_rate, asks=asks, bids=bids)
+        except Exception as e:                             # network, JSON, parsing...
+            self.last_error = f"{type(e).__name__}: {e}"
+            if self.fallback is None:
+                raise
+            q = self.fallback.get_price(symbol)
+            q.exchange = f"{self.name} (mock fallback)"
+            return q
+
+
+class BitkubExchange(RealExchange):
+    name = "Bitkub"
+    fee_rate = 0.0025
+
+    def _params(self, symbol):
+        base = symbol.split("/")[0].lower()
+        return "https://api.bitkub.com/api/v3/market/depth", {"sym": f"{base}_thb", "lmt": 20}
+
+    def _parse(self, data):
+        res = data.get("result", data)
+        return res["asks"], res["bids"]
+
+
+class BinanceTHExchange(RealExchange):
+    name = "Binance TH"
+    fee_rate = 0.0010
+
+    def _params(self, symbol):
+        base = symbol.split("/")[0].upper()
+        return "https://api.binance.th/api/v1/depth", {"symbol": f"{base}THB", "limit": 20}
+
+    def _parse(self, data):
+        return data["asks"], data["bids"]
+
+
+def build_exchanges(mode: str = "Mock") -> list[Exchange]:
+    """mode: 'Mock' | 'Live data' (real prices, paper money)."""
+    mocks = build_mock_exchanges()
+    if mode == "Mock":
+        return mocks
+    return [
+        BitkubExchange(fallback=MockExchange("Bitkub", 0.0025, 0.0010, 0.0)),
+        BinanceTHExchange(fallback=MockExchange("Binance TH", 0.0010, 0.0010, -0.0010)),
+        mocks[0],   # keep one mock so routing still has 3 venues to compare
     ]
