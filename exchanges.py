@@ -11,10 +11,12 @@ Two ideas live here:
 V0.1 only needs get_price(). Later versions will add get_orderbook(),
 get_balance(), place_order() and cancel_order() to the same interface.
 """
+import os
 import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -129,6 +131,22 @@ def build_mock_exchanges() -> list[Exchange]:
     ]
 
 
+def _load_env() -> None:
+    """Read KEY=value lines from a .env file next to this script into os.environ.
+    Real environment variables win. The file is git-ignored; never commit it."""
+    path = Path(__file__).with_name(".env")
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_env()
+
 _CACHE: dict[tuple[str, str], tuple[float, "Quote"]] = {}
 _CACHE_LOCK = threading.Lock()
 CACHE_TTL = 2.0  # seconds: stops rapid "Refresh" clicks from hammering public APIs
@@ -154,6 +172,9 @@ class RealExchange(Exchange):
     def _parse(self, data: dict) -> tuple[list, list]:
         raise NotImplementedError
 
+    def _headers(self) -> dict:
+        return {}
+
     @staticmethod
     def _levels(raw) -> list[tuple[float, float]]:
         out = []
@@ -176,7 +197,7 @@ class RealExchange(Exchange):
         try:
             url, params = self._params(symbol)
             t0 = time.perf_counter()
-            r = requests.get(url, params=params, timeout=self.timeout)
+            r = requests.get(url, params=params, headers=self._headers(), timeout=self.timeout)
             latency_ms = (time.perf_counter() - t0) * 1000
             if not r.ok:                       # show the exchange's own error message
                 raise requests.HTTPError(f"{r.status_code}: {r.text[:200]}")
@@ -227,12 +248,20 @@ class BinanceTHExchange(RealExchange):
 
 
 class InnovestXExchange(RealExchange):
-    """UNVERIFIED guess: Binance-style public depth on the Maxbit gateway.
-    Change BASE / PATH / symbol format if the warning in the app shows an error."""
+    """Maxbit gateway (Binance-style). Its depth endpoint rejects requests without an API-key header
+    (error -2014), so this adapter needs a READ-ONLY key in the INNOVESTX_API_KEY environment
+    variable or in the .env file. Only the key is sent: no secret, no signature, no trading.
+    """
     name = "InnovestX"
     fee_rate = 0.0025          # placeholder: check InnovestX's real fee
     BASE = "https://endpoint-gateway.maxbit.com"
     PATH = "/api/v1/depth"
+
+    def _headers(self):
+        key = os.environ.get("INNOVESTX_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("INNOVESTX_API_KEY is not set (put it in .env)")
+        return {"X-MBX-APIKEY": key}
 
     def _params(self, symbol):
         base = symbol.split("/")[0].upper()
