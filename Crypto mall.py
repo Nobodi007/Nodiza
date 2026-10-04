@@ -1,5 +1,5 @@
 """
-₿ Crypto Mall — V0.3 Smart Routing (mock).
+₿ Crypto Mall — V0.4 Live market data + Smart Routing (paper).
 Run with:  streamlit run app.py
 """
 import math
@@ -8,12 +8,11 @@ import pandas as pd
 import streamlit as st
 
 import portfolio
-from exchanges import build_mock_exchanges
+from exchanges import build_exchanges
 
 st.set_page_config(page_title="Crypto Mall", page_icon="₿", layout="wide")
 portfolio.init_db()
 
-EXCHANGES = build_mock_exchanges()
 SYMBOLS = ["BTC/THB", "ETH/THB"]
 
 # Streamlit re-runs this whole file on every click, so prices live in
@@ -23,6 +22,11 @@ if "quotes" not in st.session_state:
 
 with st.sidebar:
     st.header("₿ Crypto Mall")
+    mode = st.radio("Data source", ["Mock", "Live data"], horizontal=True,
+                    help="Live data = real order books, paper money only.")
+    if st.session_state.get("mode") != mode:      # switched mode -> drop old prices
+        st.session_state.mode = mode
+        st.session_state.quotes = {}
     symbol = st.selectbox("Pair", SYMBOLS)
     if st.button("Refresh prices"):
         st.session_state.quotes = {}
@@ -33,9 +37,13 @@ with st.sidebar:
         st.session_state.flash = "Wallet reset. History cleared."
         st.rerun()
 
+EXCHANGES = build_exchanges(mode)
+
 for s in SYMBOLS:
     if s not in st.session_state.quotes:
         st.session_state.quotes[s] = [ex.get_price(s) for ex in EXCHANGES]
+
+errors = [f"{ex.name}: {ex.last_error}" for ex in EXCHANGES if getattr(ex, "last_error", None)]
 
 quotes = st.session_state.quotes[symbol]
 by_name = {q.exchange: q for q in quotes}
@@ -47,8 +55,12 @@ if "flash" in st.session_state:
 
 # --- Header + wallet --------------------------------------------------------
 st.title("₿ Crypto Mall")
-st.caption("One place. Multiple exchanges.  Mock mode: simulated prices, wallet and orders. "
-           "No real money and no real exchange connection.")
+if mode == "Mock":
+    st.caption("Mock mode: simulated prices, wallet and orders. No real money, no real exchange connection.")
+else:
+    st.caption("Live data: real order books, paper money only. No orders are sent to any exchange.")
+    if errors:
+        st.warning("Some exchanges fell back to mock prices:\n\n" + "\n\n".join(errors))
 
 best_bids = {a: max(q.bid for q in st.session_state.quotes[f"{a}/THB"]) for a in ("BTC", "ETH")}
 total_value = balances["THB"] + sum(balances[a] * best_bids[a] for a in best_bids)
