@@ -113,6 +113,7 @@ def test_reset_wallet():
 # --- Live adapters (network mocked) ----------------------------------------
 class FakeResp:
     def __init__(self, data): self._d = data
+    ok = True
     def raise_for_status(self): pass
     def json(self): return self._d
 
@@ -152,3 +153,47 @@ def test_cache_prevents_second_request(monkeypatch):
 def test_fetch_quotes_keeps_exchange_order():
     exs = build_mock_exchanges()
     assert [q.exchange for q in fetch_quotes(exs, "BTC/THB")] == [e.name for e in exs]
+
+
+# --- Routing statistics -----------------------------------------------------
+def test_split_buy_records_gain_vs_single_venue():
+    a = book(asks=[(100.0, 1e6)])
+    b = book(asks=[(100.0, 1e6)])
+    a.exchange, b.exchange = "A", "B"
+    # pretend the best single venue would have given 9,900 coins less than the split
+    coins = portfolio.buy_split([(a, 10_000), (b, 10_000)], baseline=("A", 190.0))
+    assert coins == pytest.approx(200.0)
+    s = portfolio.get_route_stats()
+    assert s["compared"] == 1 and s["wins"] == 1
+    assert s["total_gain_thb"] == pytest.approx(10 * 100.0)          # 10 coins * ~100 THB
+    assert s["avg_gain_pct"] == pytest.approx(1000 / 20_000)
+
+
+def test_split_sell_records_gain_and_loss():
+    portfolio.buy(book(asks=[(100.0, 1e6)]), 10_000)
+    held = portfolio.get_balances()["BTC"]
+    q = book(bids=[(100.0, 1e6)])
+    thb = portfolio.sell_split([(q, held)], baseline=("X", 9_000.0))
+    assert portfolio.get_route_stats()["total_gain_thb"] == pytest.approx(thb - 9_000.0)
+
+
+def test_route_without_baseline_is_counted_as_split_only():
+    portfolio.buy_split([(book(asks=[(100.0, 1e6)]), 10_000)])
+    s = portfolio.get_route_stats()
+    assert (s["runs"], s["compared"], s["split_only"], s["wins"]) == (1, 0, 1, 0)
+
+
+def test_route_stats_filter_by_live_and_reset():
+    portfolio.buy_split([(book(asks=[(100.0, 1e6)], live=True), 10_000)], baseline=("X", 1.0))
+    portfolio.buy_split([(book(asks=[(100.0, 1e6)], live=False), 10_000)], baseline=("X", 1.0))
+    assert portfolio.get_route_stats(live=True)["runs"] == 1
+    assert portfolio.get_route_stats(live=False)["runs"] == 1
+    assert portfolio.get_route_stats()["runs"] == 2
+    portfolio.reset_wallet()
+    assert portfolio.get_route_stats()["runs"] == 0
+
+
+def test_failed_split_logs_no_route_run():
+    with pytest.raises(portfolio.OrderError):
+        portfolio.buy_split([(book(asks=[(1.0, 1e12)]), portfolio.START_THB * 2)], baseline=("X", 1.0))
+    assert portfolio.get_route_stats()["runs"] == 0
