@@ -8,6 +8,7 @@ import time
 import pandas as pd
 import streamlit as st
 
+import exec_panel
 import portfolio
 from exchanges import build_exchanges, fetch_quotes
 
@@ -90,7 +91,7 @@ w2.metric("BTC", f"{balances['BTC']:.8f}")
 w3.metric("ETH", f"{balances['ETH']:.8f}")
 w4.metric("Estimated total", f"฿{total_value:,.0f}", f"{total_value - portfolio.START_THB:+,.0f} vs start")
 
-trade_tab, portfolio_tab, history_tab = st.tabs(["Trade", "Portfolio", "Order history"])
+trade_tab, portfolio_tab, history_tab, exec_tab = st.tabs(["Trade", "Portfolio", "Order history", "Execution (testnet)"])
 
 # --- Trade ------------------------------------------------------------------
 with trade_tab:
@@ -380,3 +381,7 @@ with history_tab:
         )
     else:
         st.caption(f"No orders yet. Place a {'mock' if mode == 'Mock' else 'paper'} order on the Trade tab.")
+
+# --- Execution (Binance testnet, fake money) --------------------------------
+with exec_tab:
+    exec_panel.render()
