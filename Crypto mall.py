@@ -306,6 +306,21 @@ with portfolio_tab:
 # --- History ----------------------------------------------------------------
 with history_tab:
     orders = portfolio.get_orders()
+
+    def slippage_pct(o):
+        """Cost vs top of book, in %. Positive = worse than the best quote shown."""
+        if not o["ref_price"]:
+            return None
+        diff = o["price"] / o["ref_price"] - 1
+        return diff if o["side"] == "Buy" else -diff
+
+    slips = [s for s in map(slippage_pct, orders) if s is not None]
+    lats = [o["latency_ms"] for o in orders if o["latency_ms"]]
+    if slips:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Avg slippage vs top of book", f"{sum(slips) / len(slips):.4%}")
+        m2.metric("Worst slippage", f"{max(slips):.4%}")
+        m3.metric("Avg quote latency", f"{sum(lats) / len(lats):.0f} ms" if lats else "n/a (mock)")
     if orders:
         st.dataframe(
             pd.DataFrame({
@@ -317,6 +332,8 @@ with history_tab:
                 "Price": [f"฿{o['price']:,.0f}" for o in orders],
                 "Fee": [f"฿{o['fee_thb']:,.2f}" for o in orders],
                 "THB spent / received": [f"฿{o['total_thb']:,.2f}" for o in orders],
+                "Slippage": [f"{s:.4%}" if (s := slippage_pct(o)) is not None else "-" for o in orders],
+                "Latency": [f"{o['latency_ms']:.0f} ms" if o["latency_ms"] else "-" for o in orders],
                 "Status": [o["status"] for o in orders],
             }),
             hide_index=True, width="stretch",
