@@ -230,7 +230,7 @@ class RealExchange(Exchange):
                 _CACHE[key] = (time.time(), quote)
             return quote
         except Exception as e:                             # network, JSON, parsing...
-            self.last_error = f"{type(e).__name__}: {e}"
+            self.last_error = f"{type(e).__name__}: {e}{getattr(self, 'debug_note', '')}"
             if self.fallback is None:
                 raise
             q = self.fallback.get_price(symbol)
@@ -263,20 +263,21 @@ class BinanceTHExchange(RealExchange):
         return data["asks"], data["bids"]
 
 
-class InnovestXExchange(RealExchange):
+class MaxbitExchange(RealExchange):
     """Maxbit gateway (Binance-style). Its depth endpoint rejects requests without an API-key header
-    (error -2014), so this adapter needs a READ-ONLY key in the INNOVESTX_API_KEY environment
+    (error -2014), so this adapter needs a READ-ONLY key in the MAXBIT_API_KEY environment
     variable or in the .env file. Only the key is sent: no secret, no signature, no trading.
     """
-    name = "InnovestX"
-    fee_rate = 0.0025          # placeholder: check InnovestX's real fee
+    name = "Maxbit"
+    fee_rate = 0.0025          # placeholder: check Maxbit's real fee
     BASE = "https://endpoint-gateway.maxbit.com"
     PATH = "/api/v1/depth"
 
     def _headers(self):
-        key = os.environ.get("INNOVESTX_API_KEY", "").strip() or _streamlit_secret("INNOVESTX_API_KEY")
+        key = (os.environ.get("MAXBIT_API_KEY", "").strip() or _streamlit_secret("MAXBIT_API_KEY")).strip("\"' \r\n\t")
         if not key:
-            raise RuntimeError("INNOVESTX_API_KEY is not set (local: .env file; Streamlit Cloud: app Settings > Secrets)")
+            raise RuntimeError("MAXBIT_API_KEY is not set (local: .env file; Streamlit Cloud: app Settings > Secrets)")
+        self.debug_note = f" [key length sent: {len(key)}]"   # length only, never the key itself
         return {"X-MBX-APIKEY": key}
 
     def _params(self, symbol):
@@ -295,7 +296,7 @@ def build_exchanges(mode: str = "Mock") -> list[Exchange]:
     return [
         BitkubExchange(fallback=MockExchange("Bitkub", 0.0025, 0.0010, 0.0)),
         BinanceTHExchange(fallback=MockExchange("Binance TH", 0.0010, 0.0010, -0.0010)),
-        InnovestXExchange(fallback=MockExchange("InnovestX", 0.0025, 0.0010, 0.0010)),
+        MaxbitExchange(fallback=MockExchange("Maxbit", 0.0025, 0.0010, 0.0010)),
     ]
 
 
