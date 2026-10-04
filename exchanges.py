@@ -31,6 +31,7 @@ class Quote:
     bids: list[tuple[float, float]] = field(default_factory=list)
     ts: float = field(default_factory=time.time)  # when the quote was fetched
     live: bool = False                            # True = real market data
+    latency_ms: float = 0.0                       # time to fetch this quote
 
     @property
     def spread(self) -> float:
@@ -161,7 +162,9 @@ class RealExchange(Exchange):
     def get_price(self, symbol: str) -> Quote:
         try:
             url, params = self._params(symbol)
+            t0 = time.perf_counter()
             r = requests.get(url, params=params, timeout=self.timeout)
+            latency_ms = (time.perf_counter() - t0) * 1000
             r.raise_for_status()
             raw_asks, raw_bids = self._parse(r.json())
             asks = sorted(self._levels(raw_asks), key=lambda x: x[0])
@@ -170,7 +173,8 @@ class RealExchange(Exchange):
                 raise ValueError("empty order book")
             self.last_error = None
             return Quote(self.name, symbol, bid=bids[0][0], ask=asks[0][0],
-                         fee_rate=self.fee_rate, asks=asks, bids=bids, live=True)
+                         fee_rate=self.fee_rate, asks=asks, bids=bids, live=True,
+                         latency_ms=latency_ms)
         except Exception as e:                             # network, JSON, parsing...
             self.last_error = f"{type(e).__name__}: {e}"
             if self.fallback is None:
