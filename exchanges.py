@@ -29,6 +29,8 @@ class Quote:
     fee_rate: float  # 0.0025 means 0.25%
     asks: list[tuple[float, float]] = field(default_factory=list)  # (price, coin qty)
     bids: list[tuple[float, float]] = field(default_factory=list)
+    ts: float = field(default_factory=time.time)  # when the quote was fetched
+    live: bool = False                            # True = real market data
 
     @property
     def spread(self) -> float:
@@ -168,7 +170,7 @@ class RealExchange(Exchange):
                 raise ValueError("empty order book")
             self.last_error = None
             return Quote(self.name, symbol, bid=bids[0][0], ask=asks[0][0],
-                         fee_rate=self.fee_rate, asks=asks, bids=bids)
+                         fee_rate=self.fee_rate, asks=asks, bids=bids, live=True)
         except Exception as e:                             # network, JSON, parsing...
             self.last_error = f"{type(e).__name__}: {e}"
             if self.fallback is None:
