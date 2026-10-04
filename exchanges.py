@@ -225,6 +225,22 @@ class BinanceTHExchange(RealExchange):
         return data["asks"], data["bids"]
 
 
+class InnovestXExchange(RealExchange):
+    """UNVERIFIED guess: Binance-style public depth on the Maxbit gateway.
+    Change BASE / PATH / symbol format if the warning in the app shows an error."""
+    name = "InnovestX"
+    fee_rate = 0.0025          # placeholder: check InnovestX's real fee
+    BASE = "https://endpoint-gateway.maxbit.com"
+    PATH = "/api/v1/depth"
+
+    def _params(self, symbol):
+        base = symbol.split("/")[0].upper()
+        return self.BASE + self.PATH, {"symbol": f"{base}THB", "limit": 20}
+
+    def _parse(self, data):
+        return data["asks"], data["bids"]
+
+
 def build_exchanges(mode: str = "Mock") -> list[Exchange]:
     """mode: 'Mock' | 'Live data' (real prices, paper money)."""
     mocks = build_mock_exchanges()
@@ -233,7 +249,7 @@ def build_exchanges(mode: str = "Mock") -> list[Exchange]:
     return [
         BitkubExchange(fallback=MockExchange("Bitkub", 0.0025, 0.0010, 0.0)),
         BinanceTHExchange(fallback=MockExchange("Binance TH", 0.0010, 0.0010, -0.0010)),
-        mocks[0],   # keep one mock so routing still has 3 venues to compare
+        InnovestXExchange(fallback=MockExchange("InnovestX", 0.0025, 0.0010, 0.0010)),
     ]
 
 
