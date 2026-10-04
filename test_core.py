@@ -199,26 +199,26 @@ def test_failed_split_logs_no_route_run():
     assert portfolio.get_route_stats()["runs"] == 0
 
 
-# --- InnovestX key handling -------------------------------------------------
+# --- Maxbit key handling -------------------------------------------------
 def test_innovestx_without_key_falls_back_and_explains(monkeypatch):
-    monkeypatch.delenv("INNOVESTX_API_KEY", raising=False) if hasattr(monkeypatch, "delenv") else None
+    monkeypatch.delenv("MAXBIT_API_KEY", raising=False) if hasattr(monkeypatch, "delenv") else None
     import os
-    os.environ.pop("INNOVESTX_API_KEY", None)
-    ex = exchanges.InnovestXExchange(fallback=MockExchange("InnovestX", 0.0025, 0.001, 0.0))
+    os.environ.pop("MAXBIT_API_KEY", None)
+    ex = exchanges.MaxbitExchange(fallback=MockExchange("Maxbit", 0.0025, 0.001, 0.0))
     q = ex.get_price("BTC/THB")
-    assert "mock fallback" in q.exchange and "INNOVESTX_API_KEY" in ex.last_error
+    assert "mock fallback" in q.exchange and "MAXBIT_API_KEY" in ex.last_error
 
 
 def test_innovestx_sends_key_header_only(monkeypatch):
     import os
-    os.environ["INNOVESTX_API_KEY"] = "dummy-test-key"
+    os.environ["MAXBIT_API_KEY"] = "dummy-test-key"
     seen = {}
     def fake_get(url, params=None, headers=None, timeout=None):
         seen["headers"] = headers
         return FakeResp({"asks": [["101", "1"]], "bids": [["99", "1"]]})
     monkeypatch.setattr(exchanges.requests, "get", fake_get)
     try:
-        q = exchanges.InnovestXExchange().get_price("BTC/THB")
+        q = exchanges.MaxbitExchange().get_price("BTC/THB")
     finally:
-        os.environ.pop("INNOVESTX_API_KEY", None)
+        os.environ.pop("MAXBIT_API_KEY", None)
     assert q.live and seen["headers"] == {"X-MBX-APIKEY": "dummy-test-key"}
