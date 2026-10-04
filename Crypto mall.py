@@ -96,25 +96,59 @@ with trade_tab:
     st.subheader("Smart Order Routing (Mock)")
     st.caption("ระบบเปรียบเทียบผลลัพธ์ของคำสั่งขนาดที่ระบุ โดยรวม depth และค่าธรรมเนียมจากสมุดคำสั่งจำลอง")
 
-    def rank_buy(thb_amount):
-        ranked = []
+    def allocate_buy(thb_amount):
+        # Greedy allocation across every venue's ask levels, best fee-adjusted
+        # marginal cost first. Aggregate cash per venue; quote.buy() then walks
+        # that venue's depth in price order during execution.
+        chunks = []
         for q in quotes:
-            try:
-                received, fee = q.buy(thb_amount)
-                ranked.append((received, q, fee))
-            except ValueError:
-                continue
-        return max(ranked, key=lambda row: row[0]) if ranked else None
+            levels = q.asks or [(q.ask, float("inf"))]
+            for price, qty in levels:
+                cash_capacity = qty * price / (1 - q.fee_rate)
+                chunks.append((price / (1 - q.fee_rate), q, cash_capacity))
+        chunks.sort(key=lambda x: x[0])
+        remaining = thb_amount
+        allocation = {}
+        for _, q, capacity in chunks:
+            take = min(remaining, capacity)
+            if take > 1e-8:
+                allocation[q.exchange] = allocation.get(q.exchange, 0.0) + take
+                remaining -= take
+            if remaining <= 1e-7:
+                break
+        if remaining > 1e-5:
+            return None
+        legs = [(by_name[name], amount) for name, amount in allocation.items()]
+        try:
+            results = [(q, amount, *q.buy(amount)) for q, amount in legs]
+        except ValueError:
+            return None
+        return legs, results, sum(row[2] for row in results), sum(row[3] for row in results)
 
-    def rank_sell(coin_amount):
-        ranked = []
+    def allocate_sell(coin_amount):
+        chunks = []
         for q in quotes:
-            try:
-                proceeds, fee = q.sell(coin_amount)
-                ranked.append((proceeds, q, fee))
-            except ValueError:
-                continue
-        return max(ranked, key=lambda row: row[0]) if ranked else None
+            levels = q.bids or [(q.bid, float("inf"))]
+            for price, qty in levels:
+                chunks.append((price * (1 - q.fee_rate), q, qty))
+        chunks.sort(key=lambda x: x[0], reverse=True)
+        remaining = coin_amount
+        allocation = {}
+        for _, q, capacity in chunks:
+            take = min(remaining, capacity)
+            if take > 1e-12:
+                allocation[q.exchange] = allocation.get(q.exchange, 0.0) + take
+                remaining -= take
+            if remaining <= 1e-10:
+                break
+        if remaining > 1e-8:
+            return None
+        legs = [(by_name[name], amount) for name, amount in allocation.items()]
+        try:
+            results = [(q, amount, *q.sell(amount)) for q, amount in legs]
+        except ValueError:
+            return None
+        return legs, results, sum(row[2] for row in results), sum(row[3] for row in results)
 
     route_buy_col, route_sell_col = st.columns(2)
     with route_buy_col:
@@ -122,19 +156,20 @@ with trade_tab:
             "Auto Buy amount (THB)", min_value=0.0, value=50_000.0,
             step=1_000.0, key=f"route_buy_thb_{symbol}"
         )
-        buy_route = rank_buy(route_thb) if route_thb > 0 else None
-        buy_quote = buy_route[1] if buy_route else None
-        route_coins = buy_route[0] if buy_route else 0.0
-        route_fee = buy_route[2] if buy_route else 0.0
-        if buy_quote:
-            st.write(f"Best route for ฿{route_thb:,.2f}: **{buy_quote.exchange}**")
-            st.caption(f"ประมาณ {route_coins:.8f} {coin} หลังหักค่าธรรมเนียม | Fee ฿{route_fee:,.2f}")
+        buy_route = allocate_buy(route_thb) if route_thb > 0 else None
+        if buy_route:
+            buy_legs, buy_results, route_coins, route_fee = buy_route
+            st.write(f"Split route for ฿{route_thb:,.2f}: **{len(buy_legs)} exchange(s)**")
+            st.dataframe(pd.DataFrame([{"Exchange": q.exchange, "Spend (THB)": amount, "Estimated coins": coins}
+                                       for q, amount, coins, _ in buy_results]), hide_index=True, width="stretch")
+            st.caption(f"ประมาณได้รับ {route_coins:.8f} {coin} หลังหักค่าธรรมเนียม | Fee รวม ฿{route_fee:,.2f}")
         else:
-            st.warning("ไม่มี Exchange ที่มี Ask liquidity เพียงพอสำหรับยอดนี้")
-        if st.button(f"Auto Buy {coin}", type="primary", disabled=not (buy_quote and 0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
+            buy_legs = []
+            st.warning("สภาพคล่อง Ask รวมของทุก Exchange ไม่เพียงพอสำหรับยอดนี้")
+        if st.button(f"Auto Buy {coin}", type="primary", disabled=not (buy_route and 0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
             try:
-                received = portfolio.buy(buy_quote, route_thb)
-                st.session_state.flash = f"Auto-routed buy: {received:.8f} {coin} via {buy_quote.exchange}."
+                received = portfolio.buy_split(buy_legs)
+                st.session_state.flash = f"Split-routed buy: {received:.8f} {coin} across {len(buy_legs)} exchange(s)."
                 st.rerun()
             except portfolio.OrderError as e:
                 st.error(str(e))
@@ -146,19 +181,20 @@ with trade_tab:
             value=math.floor(route_held * 1e8) / 1e8,
             step=0.001, format="%.8f", key=f"route_sell_amount_{symbol}"
         )
-        sell_route = rank_sell(route_sell_amount) if route_sell_amount > 0 else None
-        sell_quote = sell_route[1] if sell_route else None
-        route_proceeds = sell_route[0] if sell_route else 0.0
-        route_sell_fee = sell_route[2] if sell_route else 0.0
-        if sell_quote:
-            st.write(f"Best route for {route_sell_amount:.8f} {coin}: **{sell_quote.exchange}**")
-            st.caption(f"ประมาณรับ ฿{route_proceeds:,.2f} หลังหักค่าธรรมเนียม | Fee ฿{route_sell_fee:,.2f}")
+        sell_route = allocate_sell(route_sell_amount) if route_sell_amount > 0 else None
+        if sell_route:
+            sell_legs, sell_results, route_proceeds, route_sell_fee = sell_route
+            st.write(f"Split route for {route_sell_amount:.8f} {coin}: **{len(sell_legs)} exchange(s)**")
+            st.dataframe(pd.DataFrame([{"Exchange": q.exchange, "Coins": amount, "Estimated THB": proceeds}
+                                       for q, amount, proceeds, _ in sell_results]), hide_index=True, width="stretch")
+            st.caption(f"ประมาณรับ ฿{route_proceeds:,.2f} หลังหักค่าธรรมเนียม | Fee รวม ฿{route_sell_fee:,.2f}")
         else:
-            st.warning("ไม่มี Exchange ที่มี Bid liquidity เพียงพอสำหรับจำนวนนี้")
-        if st.button(f"Auto Sell {coin}", type="primary", disabled=not (sell_quote and 0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
+            sell_legs = []
+            st.warning("สภาพคล่อง Bid รวมของทุก Exchange ไม่เพียงพอสำหรับจำนวนนี้")
+        if st.button(f"Auto Sell {coin}", type="primary", disabled=not (sell_route and 0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
             try:
-                received_thb = portfolio.sell(sell_quote, route_sell_amount)
-                st.session_state.flash = f"Auto-routed sell via {sell_quote.exchange}: ฿{received_thb:,.2f}."
+                received_thb = portfolio.sell_split(sell_legs)
+                st.session_state.flash = f"Split-routed sell across {len(sell_legs)} exchange(s): ฿{received_thb:,.2f}."
                 st.rerun()
             except portfolio.OrderError as e:
                 st.error(str(e))
