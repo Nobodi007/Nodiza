@@ -57,8 +57,9 @@ stale = mode == "Live data" and quote_age > STALE_AFTER
 
 # Read errors from the cached quotes, not from EXCHANGES: those objects are rebuilt on every rerun,
 # so their last_error would be empty after any click while the prices on screen are still mock.
-errors = sorted({f"{q.exchange.replace(' (mock fallback)', '')}: {q.error}"
-                 for qs in st.session_state.quotes.values() for q in qs if q.error})
+# getattr: quotes cached in session_state before an update may lack the newer fields.
+errors = sorted({f"{q.exchange.replace(' (mock fallback)', '')}: {getattr(q, 'error', '')}"
+                 for qs in st.session_state.quotes.values() for q in qs if getattr(q, "error", "")})
 
 quotes = st.session_state.quotes[symbol]
 by_name = {q.exchange: q for q in quotes}
@@ -109,14 +110,14 @@ with trade_tab:
             "Ask (you buy at)": [f"฿{q.ask:,.0f}" for q in quotes],
             "Spread": [f"฿{q.spread:,.0f} ({q.spread_pct:.2%})" for q in quotes],
             "Fee": [f"{q.fee_rate:.2%}" for q in quotes],
-            "Fee source": [FEE_SOURCE_LABEL.get(q.fee_source, q.fee_source) for q in quotes],
+            "Fee source": [FEE_SOURCE_LABEL.get(getattr(q, "fee_source", "mock"), "-") for q in quotes],
             "Buy cost after fee": [f"฿{q.effective_buy_price:,.0f}" for q in quotes],
             "Sell proceeds after fee": [f"฿{q.effective_sell_price:,.0f}" for q in quotes],
         }),
         hide_index=True, width="stretch",
     )
     if mode == "Live data":
-        fee_notes = [f"**{q.exchange}**: {q.fee_note}" for q in quotes if q.fee_note]
+        fee_notes = [f"**{q.exchange}**: {q.fee_note}" for q in quotes if getattr(q, "fee_note", "")]
         if fee_notes:
             st.caption("Fee details  \n" + "  \n".join(fee_notes))
 
