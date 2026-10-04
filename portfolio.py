@@ -144,3 +144,65 @@ def sell(quote: Quote, coins: float) -> float:
         _adjust(conn, "THB", thb)
         _record(conn, quote, "Sell", coins, (thb + fee) / coins if coins else quote.bid, fee, thb)
     return thb
+
+
+def buy_split(legs: list[tuple[Quote, float]]) -> float:
+    """Execute multi-exchange buy legs atomically; each leg is (quote, THB)."""
+    legs = [(q, float(amount)) for q, amount in legs if amount > 1e-8]
+    if not legs:
+        raise OrderError("No executable buy allocation.")
+    total_thb = sum(amount for _, amount in legs)
+    asset = legs[0][0].symbol.split("/")[0]
+    if any(q.symbol.split("/")[0] != asset for q, _ in legs):
+        raise OrderError("All split legs must use the same asset.")
+    prepared = []
+    try:
+        for quote, amount in legs:
+            coins, fee = quote.buy(amount)
+            coins = math.floor(coins * 1e8) / 1e8
+            if coins <= 0:
+                raise ValueError("Allocation is too small to fill.")
+            avg = amount * (1 - quote.fee_rate) / coins
+            prepared.append((quote, amount, coins, fee, avg))
+    except ValueError as e:
+        raise OrderError(str(e)) from e
+    with db() as conn:
+        have = _balance(conn, "THB")
+        if total_thb > have + 1e-9:
+            raise OrderError(f"Not enough THB. You have ฿{have:,.2f}.")
+        _adjust(conn, "THB", -total_thb)
+        total_coins = 0.0
+        for quote, amount, coins, fee, avg in prepared:
+            _adjust(conn, asset, coins)
+            _record(conn, quote, "Buy", coins, avg, fee, amount)
+            total_coins += coins
+    return total_coins
+
+
+def sell_split(legs: list[tuple[Quote, float]]) -> float:
+    """Execute multi-exchange sell legs atomically; each leg is (quote, coins)."""
+    legs = [(q, float(amount)) for q, amount in legs if amount > 1e-12]
+    if not legs:
+        raise OrderError("No executable sell allocation.")
+    asset = legs[0][0].symbol.split("/")[0]
+    if any(q.symbol.split("/")[0] != asset for q, _ in legs):
+        raise OrderError("All split legs must use the same asset.")
+    prepared = []
+    try:
+        for quote, amount in legs:
+            proceeds, fee = quote.sell(amount)
+            prepared.append((quote, amount, proceeds, fee, (proceeds + fee) / amount))
+    except ValueError as e:
+        raise OrderError(str(e)) from e
+    total_coins = sum(amount for _, amount, *_ in prepared)
+    with db() as conn:
+        have = _balance(conn, asset)
+        if total_coins > have + 1e-8:
+            raise OrderError(f"Not enough {asset}. You have {have:.8f}.")
+        total_thb = 0.0
+        for quote, amount, proceeds, fee, avg in prepared:
+            _adjust(conn, asset, -amount)
+            _adjust(conn, "THB", proceeds)
+            _record(conn, quote, "Sell", amount, avg, fee, proceeds)
+            total_thb += proceeds
+    return total_thb
