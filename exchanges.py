@@ -178,7 +178,8 @@ class RealExchange(Exchange):
             t0 = time.perf_counter()
             r = requests.get(url, params=params, timeout=self.timeout)
             latency_ms = (time.perf_counter() - t0) * 1000
-            r.raise_for_status()
+            if not r.ok:                       # show the exchange's own error message
+                raise requests.HTTPError(f"{r.status_code}: {r.text[:200]}")
             raw_asks, raw_bids = self._parse(r.json())
             asks = sorted(self._levels(raw_asks), key=lambda x: x[0])
             bids = sorted(self._levels(raw_bids), key=lambda x: -x[0])
