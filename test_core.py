@@ -15,6 +15,7 @@ from exchanges import BitkubExchange, MockExchange, Quote, build_mock_exchanges,
 def fresh_state(tmp_path, monkeypatch):
     monkeypatch.setattr(portfolio, "DB_PATH", tmp_path / "test.db")
     exchanges._CACHE.clear()
+    exchanges._FEE_CACHE.clear()
     portfolio.init_db()
 
 
@@ -268,7 +269,8 @@ def test_innovestx_signs_post_and_parses_book(monkeypatch):
     os.environ["INNOVESTX_API_KEY"], os.environ["INNOVESTX_API_SECRET"] = "mykey", "mysecret"
     seen = {}
     def fake_post(url, data=None, headers=None, timeout=None):
-        seen.update(url=url, data=data, headers=headers)
+        if url.endswith("/orderbook/lvl2"):                          # ignore the fee-tier call
+            seen.update(url=url, data=data, headers=headers)
         return FakeResp(INVX_BOOK)
     monkeypatch.setattr(exchanges.requests, "post", fake_post)
     try:
@@ -296,3 +298,81 @@ def test_innovestx_error_code_falls_back_with_reason(monkeypatch):
     finally:
         _clear_invx()
     assert "mock fallback" in q.exchange and "4003" in ex.last_error and "whitelist" in ex.last_error.lower()
+
+
+# --- InnovestX live fee --------------------------------------------------
+def _invx_post(fee_resp, calls=None):
+    def fake_post(url, data=None, headers=None, timeout=None):
+        if calls is not None:
+            calls.append(url)
+        return FakeResp(fee_resp if url.endswith("/symbol/fee/tier") else INVX_BOOK)
+    return fake_post
+
+
+def _with_invx_env():
+    import os
+    _clear_invx()
+    os.environ["INNOVESTX_API_KEY"], os.environ["INNOVESTX_API_SECRET"] = "k", "s"
+
+
+def test_innovestx_uses_live_percentage_fee(monkeypatch):
+    _with_invx_env()
+    fee = {"code": "0000", "message": "SUCCESS", "data": {"symbol": "BTCTHB", "feeAmount": "0.25", "feeType": "Percentage"}}
+    monkeypatch.setattr(exchanges.requests, "post", _invx_post(fee))
+    try:
+        ex = exchanges.InnovestXExchange()
+        q = ex.get_price("BTC/THB")
+    finally:
+        _clear_invx()
+    assert q.fee_rate == pytest.approx(0.0025) and ex.fee_source == "live"
+
+
+def test_innovestx_fee_accepts_fraction_form(monkeypatch):
+    _with_invx_env()
+    fee = {"code": "0000", "data": [{"feeAmount": "0.0015", "feeType": "Percentage"}]}
+    monkeypatch.setattr(exchanges.requests, "post", _invx_post(fee))
+    try:
+        q = exchanges.InnovestXExchange().get_price("BTC/THB")
+    finally:
+        _clear_invx()
+    assert q.fee_rate == pytest.approx(0.0015)
+
+
+def test_innovestx_flat_or_failed_fee_keeps_placeholder(monkeypatch):
+    _with_invx_env()
+    fee = {"code": "0000", "data": {"feeAmount": "10", "feeType": "FlatRate"}}
+    monkeypatch.setattr(exchanges.requests, "post", _invx_post(fee))
+    try:
+        ex = exchanges.InnovestXExchange()
+        q = ex.get_price("BTC/THB")
+    finally:
+        _clear_invx()
+    assert q.fee_rate == 0.0025 and ex.fee_source == "placeholder" and "FlatRate" in ex.fee_note
+
+
+def test_innovestx_fee_is_cached(monkeypatch):
+    _with_invx_env()
+    calls = []
+    fee = {"code": "0000", "data": {"feeAmount": "0.25", "feeType": "Percentage"}}
+    monkeypatch.setattr(exchanges.requests, "post", _invx_post(fee, calls))
+    try:
+        exchanges.InnovestXExchange().get_price("BTC/THB")
+        exchanges._CACHE.clear()                                    # force a new order-book call
+        exchanges.InnovestXExchange().get_price("BTC/THB")
+    finally:
+        _clear_invx()
+    assert sum(c.endswith("/symbol/fee/tier") for c in calls) == 1
+
+
+def test_innovestx_fee_env_override(monkeypatch):
+    import os
+    _with_invx_env()
+    os.environ["INNOVESTX_FEE_RATE"] = "0.0018"
+    calls = []
+    monkeypatch.setattr(exchanges.requests, "post", _invx_post({}, calls))
+    try:
+        q = exchanges.InnovestXExchange().get_price("BTC/THB")
+    finally:
+        _clear_invx()
+        os.environ.pop("INNOVESTX_FEE_RATE", None)
+    assert q.fee_rate == 0.0018 and not any(c.endswith("/symbol/fee/tier") for c in calls)
