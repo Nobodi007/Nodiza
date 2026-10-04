@@ -127,10 +127,19 @@ with trade_tab:
         depth_rows = ([{"Side": "ASK", "Price (THB)": px, "Quantity": qty} for px, qty in depth_q.asks]
                       + [{"Side": "BID", "Price (THB)": px, "Quantity": qty} for px, qty in depth_q.bids])
         st.dataframe(pd.DataFrame(depth_rows), hide_index=True, width="stretch")
-        st.caption("Order Book เป็นข้อมูลจำลอง 5 ระดับราคา; การซื้อขายจะไล่กินสภาพคล่องตามระดับราคาและบันทึกราคาเฉลี่ยถ่วงน้ำหนัก")
+        if mode == "Mock":
+            st.caption("Order Book เป็นข้อมูลจำลอง 5 ระดับราคา; การซื้อขายจะไล่กินสภาพคล่องตามระดับราคาและบันทึกราคาเฉลี่ยถ่วงน้ำหนัก")
+        else:
+            st.caption("Order Book จริงจากแต่ละ exchange (จำนวนระดับราคาขึ้นกับที่เขาส่งมา) ยกเว้นแถวที่ติดป้าย (mock fallback) "
+                       "ซึ่งเป็นข้อมูลจำลอง; การซื้อขายเป็นเงินกระดาษ ไล่กินสภาพคล่องตามระดับราคาและบันทึกราคาเฉลี่ยถ่วงน้ำหนัก")
 
-    st.subheader("Smart Order Routing (Mock)")
-    st.caption("ระบบเปรียบเทียบผลลัพธ์ของคำสั่งขนาดที่ระบุ โดยรวม depth และค่าธรรมเนียมจากสมุดคำสั่งจำลอง")
+    if mode == "Mock":
+        st.subheader("Smart Order Routing (Mock)")
+        st.caption("ระบบเปรียบเทียบผลลัพธ์ของคำสั่งขนาดที่ระบุ โดยรวม depth และค่าธรรมเนียมจากสมุดคำสั่งจำลอง")
+    else:
+        st.subheader("Smart Order Routing (Live data, paper)")
+        st.caption("ระบบเปรียบเทียบผลลัพธ์ของคำสั่งขนาดที่ระบุ โดยรวม depth และค่าธรรมเนียมจากสมุดคำสั่งจริง "
+                   "แต่เป็นเงินกระดาษ ไม่มีคำสั่งถูกส่งไปที่ exchange จริง")
 
     def allocate_buy(thb_amount):
         # Greedy allocation across every venue's ask levels, best fee-adjusted
@@ -319,7 +328,7 @@ with portfolio_tab:
         }),
         hide_index=True, width="stretch",
     )
-    st.caption("Coins are valued at the best bid across the three exchanges, before fees.")
+    st.caption("Coins are valued at the best bid across the exchanges shown, before fees.")
 
 # --- History ----------------------------------------------------------------
 with history_tab:
@@ -370,4 +379,4 @@ with history_tab:
             hide_index=True, width="stretch",
         )
     else:
-        st.caption("No orders yet. Place a mock order on the Trade tab.")
+        st.caption(f"No orders yet. Place a {'mock' if mode == 'Mock' else 'paper'} order on the Trade tab.")
