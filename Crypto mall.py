@@ -162,7 +162,20 @@ with trade_tab:
             st.write(f"Split route for ฿{route_thb:,.2f}: **{len(buy_legs)} exchange(s)**")
             st.dataframe(pd.DataFrame([{"Exchange": q.exchange, "Spend (THB)": amount, "Estimated coins": coins}
                                        for q, amount, coins, _ in buy_results]), hide_index=True, width="stretch")
+            buy_avg = route_thb / route_coins if route_coins else 0.0
+            single_buy = []
+            for q in quotes:
+                try:
+                    one_coins, one_fee = q.buy(route_thb)
+                    single_buy.append((one_coins, q, one_fee))
+                except ValueError:
+                    pass
+            single_best = max(single_buy, key=lambda row: row[0]) if single_buy else None
             st.caption(f"ประมาณได้รับ {route_coins:.8f} {coin} หลังหักค่าธรรมเนียม | Fee รวม ฿{route_fee:,.2f}")
+            st.metric("Execution average buy price", f"฿{buy_avg:,.2f}/{coin}")
+            if single_best:
+                gain = route_coins - single_best[0]
+                st.caption(f"เทียบกับกระดานเดียวที่ดีที่สุด: {gain:+.8f} {coin} ({gain / single_best[0] * 100:+.3f}%)")
         else:
             buy_legs = []
             st.warning("สภาพคล่อง Ask รวมของทุก Exchange ไม่เพียงพอสำหรับยอดนี้")
@@ -187,7 +200,20 @@ with trade_tab:
             st.write(f"Split route for {route_sell_amount:.8f} {coin}: **{len(sell_legs)} exchange(s)**")
             st.dataframe(pd.DataFrame([{"Exchange": q.exchange, "Coins": amount, "Estimated THB": proceeds}
                                        for q, amount, proceeds, _ in sell_results]), hide_index=True, width="stretch")
+            sell_avg = route_proceeds / route_sell_amount if route_sell_amount else 0.0
+            single_sell = []
+            for q in quotes:
+                try:
+                    one_thb, one_fee = q.sell(route_sell_amount)
+                    single_sell.append((one_thb, q, one_fee))
+                except ValueError:
+                    pass
+            single_best = max(single_sell, key=lambda row: row[0]) if single_sell else None
             st.caption(f"ประมาณรับ ฿{route_proceeds:,.2f} หลังหักค่าธรรมเนียม | Fee รวม ฿{route_sell_fee:,.2f}")
+            st.metric("Execution average sell price", f"฿{sell_avg:,.2f}/{coin}")
+            if single_best:
+                improvement = route_proceeds - single_best[0]
+                st.caption(f"เทียบกับกระดานเดียวที่ดีที่สุด: {improvement:+,.2f} THB ({improvement / single_best[0] * 100:+.3f}%)")
         else:
             sell_legs = []
             st.warning("สภาพคล่อง Bid รวมของทุก Exchange ไม่เพียงพอสำหรับจำนวนนี้")
