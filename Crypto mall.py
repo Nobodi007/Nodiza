@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 import portfolio
-from exchanges import build_exchanges
+from exchanges import build_exchanges, fetch_quotes
 
 st.set_page_config(page_title="Crypto Mall", page_icon="₿", layout="wide")
 portfolio.init_db()
@@ -42,7 +42,7 @@ EXCHANGES = build_exchanges(mode)
 
 for s in SYMBOLS:
     if s not in st.session_state.quotes:
-        st.session_state.quotes[s] = [ex.get_price(s) for ex in EXCHANGES]
+        st.session_state.quotes[s] = fetch_quotes(EXCHANGES, s)
 
 STALE_AFTER = 30  # seconds; live quotes older than this can't be traded
 quote_age = time.time() - min(q.ts for q in st.session_state.quotes[symbol])
