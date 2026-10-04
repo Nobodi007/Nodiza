@@ -13,7 +13,7 @@ get_balance(), place_order() and cancel_order() to the same interface.
 """
 import random
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -24,6 +24,8 @@ class Quote:
     bid: float       # highest price buyers pay  -> the price YOU get when you SELL
     ask: float       # lowest price sellers want -> the price YOU pay when you BUY
     fee_rate: float  # 0.0025 means 0.25%
+    asks: list[tuple[float, float]] = field(default_factory=list)  # (price, coin qty)
+    bids: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def spread(self) -> float:
@@ -44,13 +46,34 @@ class Quote:
         return self.bid * (1 - self.fee_rate)
 
     def buy(self, thb: float) -> tuple[float, float]:
-        """Spend `thb`. Returns (coins received, fee in THB)."""
+        """Spend THB across ask levels; returns (coins received, fee THB)."""
         fee = thb * self.fee_rate
-        return (thb - fee) / self.ask, fee
+        budget = thb - fee
+        levels = self.asks or [(self.ask, float("inf"))]
+        coins = 0.0
+        for price, qty in levels:
+            take = min(qty, budget / price)
+            coins += take
+            budget -= take * price
+            if budget <= 1e-8:
+                break
+        if budget > 1e-6:
+            raise ValueError("Insufficient ask-side liquidity in mock order book.")
+        return coins, fee
 
     def sell(self, coins: float) -> tuple[float, float]:
-        """Sell `coins`. Returns (THB received after fee, fee in THB)."""
-        gross = coins * self.bid
+        """Sell across bid levels; returns (net THB, fee THB)."""
+        remaining = coins
+        gross = 0.0
+        levels = self.bids or [(self.bid, float("inf"))]
+        for price, qty in levels:
+            take = min(qty, remaining)
+            gross += take * price
+            remaining -= take
+            if remaining <= 1e-12:
+                break
+        if remaining > 1e-8:
+            raise ValueError("Insufficient bid-side liquidity in mock order book.")
         fee = gross * self.fee_rate
         return gross - fee, fee
 
@@ -81,7 +104,12 @@ class MockExchange(Exchange):
         noise = random.uniform(-0.0005, 0.0005)       # small random wobble
         mid = fair * (1 + self.price_bias + noise)
         half = mid * self.spread_pct / 2
-        return Quote(self.name, symbol, bid=mid - half, ask=mid + half, fee_rate=self.fee_rate)
+        bid, ask = mid - half, mid + half
+        # Synthetic depth: 5 price levels, with finite liquidity at each level.
+        base_qty = 0.25 if symbol.startswith("BTC") else 8.0
+        bids = [(bid * (1 - 0.0004 * i), base_qty * (1 + i * 0.5)) for i in range(5)]
+        asks = [(ask * (1 + 0.0004 * i), base_qty * (1 + i * 0.5)) for i in range(5)]
+        return Quote(self.name, symbol, bid=bid, ask=ask, fee_rate=self.fee_rate, asks=asks, bids=bids)
 
 
 def build_mock_exchanges() -> list[Exchange]:
