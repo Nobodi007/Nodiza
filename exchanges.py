@@ -163,6 +163,12 @@ def _streamlit_secret(name: str) -> str:
         return ""
 
 
+def _secret(name: str) -> str:
+    """Env var / .env first, then Streamlit Cloud secrets. Surrounding quotes and spaces are stripped."""
+    val = os.environ.get(name, "").strip() or _streamlit_secret(name)
+    return val.strip("\"' \r\n\t")
+
+
 _CACHE: dict[tuple[str, str], tuple[float, "Quote"]] = {}
 _CACHE_LOCK = threading.Lock()
 CACHE_TTL = 2.0  # seconds: stops rapid "Refresh" clicks from hammering public APIs
@@ -190,6 +196,10 @@ class RealExchange(Exchange):
 
     def _headers(self) -> dict:
         return {}
+
+    def configured(self) -> bool:
+        """False = missing key/URL; build_exchanges() then leaves this venue out instead of faking prices."""
+        return True
 
     @staticmethod
     def _levels(raw) -> list[tuple[float, float]]:
@@ -264,19 +274,22 @@ class BinanceTHExchange(RealExchange):
 
 
 class MaxbitExchange(RealExchange):
-    """Maxbit gateway (Binance-style). Its depth endpoint rejects requests without an API-key header
-    (error -2014), so this adapter needs a READ-ONLY key in the MAXBIT_API_KEY environment
-    variable or in the .env file. Only the key is sent: no secret, no signature, no trading.
-    """
+    """Maxbit gateway (Binance-style). Its depth endpoint needs an API-key header, so this adapter
+    needs a READ-ONLY Maxbit key in MAXBIT_API_KEY (.env locally, Settings > Secrets on Streamlit Cloud).
+    Only the key is sent: no secret, no signature, no trading. Endpoint path is UNVERIFIED."""
     name = "Maxbit"
     fee_rate = 0.0025          # placeholder: check Maxbit's real fee
+    KEY_VAR = "MAXBIT_API_KEY"
     BASE = "https://endpoint-gateway.maxbit.com"
     PATH = "/api/v1/depth"
 
+    def configured(self):
+        return bool(_secret(self.KEY_VAR))
+
     def _headers(self):
-        key = (os.environ.get("MAXBIT_API_KEY", "").strip() or _streamlit_secret("MAXBIT_API_KEY")).strip("\"' \r\n\t")
+        key = _secret(self.KEY_VAR)
         if not key:
-            raise RuntimeError("MAXBIT_API_KEY is not set (local: .env file; Streamlit Cloud: app Settings > Secrets)")
+            raise RuntimeError(f"{self.KEY_VAR} is not set (local: .env file; Streamlit Cloud: app Settings > Secrets)")
         self.debug_note = f" [key length sent: {len(key)}]"   # length only, never the key itself
         return {"X-MBX-APIKEY": key}
 
@@ -288,16 +301,37 @@ class MaxbitExchange(RealExchange):
         return data["asks"], data["bids"]
 
 
+class InnovestXExchange(MaxbitExchange):
+    """InnovestX. I could NOT find its public API docs, so nothing is guessed here:
+    set INNOVESTX_API_KEY (read-only key) and INNOVESTX_BASE_URL (its API host, from InnovestX's docs).
+    Optional INNOVESTX_DEPTH_PATH (default /api/v1/depth). Assumes a Binance-style depth response."""
+    name = "InnovestX"
+    fee_rate = 0.0025          # placeholder: check InnovestX's real fee
+    KEY_VAR = "INNOVESTX_API_KEY"
+
+    def configured(self):
+        return bool(_secret(self.KEY_VAR) and _secret("INNOVESTX_BASE_URL"))
+
+    def _params(self, symbol):
+        base_url = _secret("INNOVESTX_BASE_URL").rstrip("/")
+        path = _secret("INNOVESTX_DEPTH_PATH") or "/api/v1/depth"
+        return base_url + path, {"symbol": f"{symbol.split('/')[0].upper()}THB", "limit": 20}
+
+
 def build_exchanges(mode: str = "Mock") -> list[Exchange]:
-    """mode: 'Mock' | 'Live data' (real prices, paper money)."""
-    mocks = build_mock_exchanges()
+    """mode: 'Mock' | 'Live data' (real prices, paper money).
+
+    In Live data mode a venue without credentials is left out, never replaced by fake prices.
+    (A configured venue that errors at runtime still falls back to a labelled mock quote.)"""
     if mode == "Mock":
-        return mocks
-    return [
+        return build_mock_exchanges()
+    live = [
         BitkubExchange(fallback=MockExchange("Bitkub", 0.0025, 0.0010, 0.0)),
         BinanceTHExchange(fallback=MockExchange("Binance TH", 0.0010, 0.0010, -0.0010)),
         MaxbitExchange(fallback=MockExchange("Maxbit", 0.0025, 0.0010, 0.0010)),
+        InnovestXExchange(fallback=MockExchange("InnovestX", 0.0025, 0.0010, 0.0005)),
     ]
+    return [ex for ex in live if ex.configured()]
 
 
 def fetch_quotes(exchanges: list[Exchange], symbol: str) -> list[Quote]:
