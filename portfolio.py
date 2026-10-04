@@ -98,9 +98,9 @@ def _adjust(conn, asset: str, delta: float) -> None:
 def _record(conn, quote: Quote, side: str, coins: float, price: float, fee: float, total_thb: float) -> None:
     conn.execute(
         """INSERT INTO orders (created_at, symbol, side, exchange, coins, price, fee_thb, total_thb, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Filled (mock)')""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), quote.symbol, side, quote.exchange,
-         coins, price, fee, total_thb),
+         coins, price, fee, total_thb, "Filled (paper)" if quote.live else "Filled (mock)"),
     )
 
 
