@@ -1,5 +1,5 @@
 """
-₿ Crypto Mall — V0.2.2 mock trading.
+₿ Crypto Mall — V0.3 Smart Routing (mock).
 Run with:  streamlit run app.py
 """
 import math
@@ -84,7 +84,46 @@ with trade_tab:
         hide_index=True, width="stretch",
     )
 
-    st.subheader(f"Place a mock order: {symbol}")
+    st.subheader("Smart Order Routing (Mock)")
+    st.caption("ระบบเลือก Exchange ที่ให้ผลลัพธ์สุทธิดีที่สุดจากราคาและค่าธรรมเนียมที่มีอยู่ใน Mock quotes")
+
+    route_buy_col, route_sell_col = st.columns(2)
+    with route_buy_col:
+        route_thb = st.number_input(
+            "Auto Buy amount (THB)", min_value=0.0, value=50_000.0,
+            step=1_000.0, key=f"route_buy_thb_{symbol}"
+        )
+        route_coins, route_fee = best_buy.buy(route_thb) if route_thb > 0 else (0.0, 0.0)
+        st.write(f"Best route: **{best_buy.exchange}**")
+        st.caption(f"ประมาณ {route_coins:.8f} {coin} หลังหักค่าธรรมเนียม")
+        if st.button(f"Auto Buy {coin}", type="primary", disabled=not (0 < route_thb <= balances["THB"]), key=f"auto_buy_{symbol}"):
+            try:
+                received = portfolio.buy(best_buy, route_thb)
+                st.session_state.flash = f"Auto-routed buy: {received:.8f} {coin} via {best_buy.exchange}."
+                st.rerun()
+            except portfolio.OrderError as e:
+                st.error(str(e))
+
+    with route_sell_col:
+        route_held = balances[coin]
+        route_sell_amount = st.number_input(
+            f"Auto Sell amount ({coin})", min_value=0.0,
+            value=math.floor(route_held * 1e8) / 1e8,
+            step=0.001, format="%.8f", key=f"route_sell_amount_{symbol}"
+        )
+        route_proceeds, route_sell_fee = best_sell.sell(route_sell_amount) if route_sell_amount > 0 else (0.0, 0.0)
+        st.write(f"Best route: **{best_sell.exchange}**")
+        st.caption(f"ประมาณรับ ฿{route_proceeds:,.2f} หลังหักค่าธรรมเนียม")
+        if st.button(f"Auto Sell {coin}", type="primary", disabled=not (0 < route_sell_amount <= route_held + 1e-8), key=f"auto_sell_{symbol}"):
+            try:
+                received_thb = portfolio.sell(best_sell, route_sell_amount)
+                st.session_state.flash = f"Auto-routed sell via {best_sell.exchange}: ฿{received_thb:,.2f}."
+                st.rerun()
+            except portfolio.OrderError as e:
+                st.error(str(e))
+
+    st.divider()
+    st.subheader(f"Manual order: {symbol}")
     buy_col, sell_col = st.columns(2)
 
     with buy_col:
