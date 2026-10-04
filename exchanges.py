@@ -176,6 +176,7 @@ def _secret(name: str) -> str:
 
 _CACHE: dict[tuple[str, str], tuple[float, "Quote"]] = {}
 _CACHE_LOCK = threading.Lock()
+_FEE_CACHE: dict[tuple[str, str], tuple] = {}   # (venue, symbol) -> (ts, rate | None, note, ttl)
 CACHE_TTL = 2.0  # seconds: stops rapid "Refresh" clicks from hammering public APIs
 
 
@@ -201,6 +202,10 @@ class RealExchange(Exchange):
 
     def _headers(self) -> dict:
         return {}
+
+    def _fee_rate(self, symbol: str) -> float:
+        """Fee used for this quote. Adapters that can look up their real fee override this."""
+        return self.fee_rate
 
     def _fetch(self, url: str, params: dict):
         """Default: plain GET. Adapters needing POST/signing override this."""
@@ -244,7 +249,7 @@ class RealExchange(Exchange):
                 raise ValueError("empty order book")
             self.last_error = None
             quote = Quote(self.name, symbol, bid=bids[0][0], ask=asks[0][0],
-                         fee_rate=self.fee_rate, asks=asks, bids=bids, live=True,
+                         fee_rate=self._fee_rate(symbol), asks=asks, bids=bids, live=True,
                          latency_ms=latency_ms)
             with _CACHE_LOCK:
                 _CACHE[key] = (time.time(), quote)
@@ -327,12 +332,68 @@ class InnovestXExchange(RealExchange):
     DEFAULT_BASE = "https://api.innovestxonline.com"
     DEFAULT_PATH = "/api/v1/digital-asset/orderbook/lvl2"
     DEPTH = 100
+    FEE_PATH = "/api/v1/digital-asset/symbol/fee/tier"
+    FEE_TTL = 3600           # real fee changes rarely (tiers): look it up once an hour
+    FEE_FAIL_TTL = 300       # after a failed lookup, retry in 5 min instead of on every refresh
+    MAX_PLAUSIBLE_FEE = 0.02  # a parsed fee above 2% is treated as a misread, not used
+    fee_source = "placeholder"   # "live" | "env" | "placeholder": the app can show this
+    fee_note = ""                # why/how the fee was chosen (diagnostics)
 
     def configured(self):
         return bool(_secret("INNOVESTX_API_KEY") and _secret("INNOVESTX_API_SECRET"))
 
+    def _base_url(self):
+        return (_secret("INNOVESTX_BASE_URL") or self.DEFAULT_BASE).rstrip("/")
+
+    @staticmethod
+    def _parse_fee(data):
+        """POST /symbol/fee/tier -> (rate as fraction, raw feeAmount). Only Percentage fees are used.
+        UNVERIFIED: the docs don't say whether a percentage comes as 0.25 (percent) or 0.0025
+        (fraction). Values >= 0.05 are read as percent, smaller ones as a fraction; anything that
+        ends up above MAX_PLAUSIBLE_FEE is rejected. Set INNOVESTX_FEE_RATE to override."""
+        if str(data.get("code")) != "0000":
+            raise ValueError(f"fee API {data.get('code')}: {data.get('message')}")
+        d = data.get("data")
+        rows = d if isinstance(d, list) else [d]
+        pct = [r for r in rows if isinstance(r, dict) and str(r.get("feeType", "")).lower() == "percentage"]
+        if not pct:
+            raise ValueError(f"no percentage fee (feeType={[r.get('feeType') for r in rows if isinstance(r, dict)]})")
+        raw = max(float(r["feeAmount"]) for r in pct)      # several order types: take the highest
+        rate = raw / 100 if raw >= 0.05 else raw
+        if not 0 <= rate <= InnovestXExchange.MAX_PLAUSIBLE_FEE:
+            raise ValueError(f"implausible fee value {raw}")
+        return rate, raw
+
+    def _fee_rate(self, symbol):
+        override = _secret("INNOVESTX_FEE_RATE")
+        if override:
+            try:
+                rate = float(override)
+                self.fee_source, self.fee_note = "env", f"INNOVESTX_FEE_RATE={override}"
+                return rate
+            except ValueError:
+                pass
+        sym = f"{symbol.split('/')[0].upper()}THB"
+        key = (self.name, sym)
+        with _CACHE_LOCK:
+            hit = _FEE_CACHE.get(key)
+        if not hit or time.time() - hit[0] >= hit[3]:
+            try:
+                r = self._fetch(self._base_url() + self.FEE_PATH, {"symbol": sym})
+                if not r.ok:
+                    raise requests.HTTPError(f"{r.status_code}: {r.text[:200]}")
+                rate, raw = self._parse_fee(r.json())
+                hit = (time.time(), rate, f"live feeAmount={raw} -> {rate:.4%}", self.FEE_TTL)
+            except Exception as e:                      # never let a fee lookup break the quote
+                hit = (time.time(), None, f"placeholder {self.fee_rate:.2%} ({type(e).__name__}: {e})", self.FEE_FAIL_TTL)
+            with _CACHE_LOCK:
+                _FEE_CACHE[key] = hit
+        self.fee_source = "live" if hit[1] is not None else "placeholder"
+        self.fee_note = hit[2]
+        return hit[1] if hit[1] is not None else self.fee_rate
+
     def _params(self, symbol):
-        base_url = (_secret("INNOVESTX_BASE_URL") or self.DEFAULT_BASE).rstrip("/")
+        base_url = self._base_url()
         path = _secret("INNOVESTX_DEPTH_PATH") or self.DEFAULT_PATH
         return base_url + path, {"symbol": f"{symbol.split('/')[0].upper()}THB", "depth": self.DEPTH}
 
