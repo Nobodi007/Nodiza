@@ -15,6 +15,13 @@ st.set_page_config(page_title="Crypto Mall", page_icon="₿", layout="wide")
 portfolio.init_db()
 
 SYMBOLS = ["BTC/THB", "ETH/THB"]
+FEE_SOURCE_LABEL = {
+    "live": "Live (from exchange API)",
+    "env": "Your setting (.env / Secrets)",
+    "default": "Built-in default",
+    "placeholder": "Built-in default",
+    "mock": "Simulated",
+}
 
 # Streamlit re-runs this whole file on every click, so prices live in
 # session_state and only change when you press "Refresh prices".
@@ -48,7 +55,10 @@ STALE_AFTER = 30  # seconds; live quotes older than this can't be traded
 quote_age = time.time() - min(q.ts for q in st.session_state.quotes[symbol])
 stale = mode == "Live data" and quote_age > STALE_AFTER
 
-errors = [f"{ex.name}: {ex.last_error}" for ex in EXCHANGES if getattr(ex, "last_error", None)]
+# Read errors from the cached quotes, not from EXCHANGES: those objects are rebuilt on every rerun,
+# so their last_error would be empty after any click while the prices on screen are still mock.
+errors = sorted({f"{q.exchange.replace(' (mock fallback)', '')}: {q.error}"
+                 for qs in st.session_state.quotes.values() for q in qs if q.error})
 
 quotes = st.session_state.quotes[symbol]
 by_name = {q.exchange: q for q in quotes}
@@ -99,11 +109,16 @@ with trade_tab:
             "Ask (you buy at)": [f"฿{q.ask:,.0f}" for q in quotes],
             "Spread": [f"฿{q.spread:,.0f} ({q.spread_pct:.2%})" for q in quotes],
             "Fee": [f"{q.fee_rate:.2%}" for q in quotes],
+            "Fee source": [FEE_SOURCE_LABEL.get(q.fee_source, q.fee_source) for q in quotes],
             "Buy cost after fee": [f"฿{q.effective_buy_price:,.0f}" for q in quotes],
             "Sell proceeds after fee": [f"฿{q.effective_sell_price:,.0f}" for q in quotes],
         }),
         hide_index=True, width="stretch",
     )
+    if mode == "Live data":
+        fee_notes = [f"**{q.exchange}**: {q.fee_note}" for q in quotes if q.fee_note]
+        if fee_notes:
+            st.caption("Fee details  \n" + "  \n".join(fee_notes))
 
     with st.expander(f"Order Book & Liquidity — {symbol}", expanded=True):
         depth_exchange = st.selectbox("View depth", [q.exchange for q in quotes], key=f"depth_{symbol}")
