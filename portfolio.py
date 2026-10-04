@@ -67,6 +67,18 @@ def init_db() -> None:
         for col in ("ref_price", "latency_ms"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE orders ADD COLUMN {col} REAL NOT NULL DEFAULT 0")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS route_runs (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   created_at TEXT NOT NULL,
+                   symbol TEXT NOT NULL,
+                   side TEXT NOT NULL,
+                   venues INTEGER NOT NULL,
+                   notional_thb REAL NOT NULL,
+                   single_exchange TEXT,
+                   gain_thb REAL,
+                   live INTEGER NOT NULL DEFAULT 0)"""
+        )
         for asset in ASSETS:
             start = START_THB if asset == "THB" else 0.0
             conn.execute("INSERT OR IGNORE INTO balances (asset, amount) VALUES (?, ?)", (asset, start))
@@ -76,6 +88,7 @@ def reset_wallet() -> None:
     """Back to ฿1,000,000 and an empty history."""
     with db() as conn:
         conn.execute("DELETE FROM orders")
+        conn.execute("DELETE FROM route_runs")
         for asset in ASSETS:
             conn.execute("UPDATE balances SET amount = ? WHERE asset = ?",
                          (START_THB if asset == "THB" else 0.0, asset))
@@ -110,6 +123,44 @@ def _record(conn, quote: Quote, side: str, coins: float, price: float, fee: floa
          coins, price, fee, total_thb, "Filled (paper)" if quote.live else "Filled (mock)",
          ref, quote.latency_ms),
     )
+
+
+def _record_route(conn, quotes: list[Quote], side: str, notional: float,
+                  single_exchange: str | None, gain_thb: float | None) -> None:
+    """Log one split-routed order next to the best single-venue alternative."""
+    conn.execute(
+        """INSERT INTO route_runs (created_at, symbol, side, venues, notional_thb, single_exchange, gain_thb, live)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), quotes[0].symbol, side, len(quotes),
+         notional, single_exchange, gain_thb, int(all(q.live for q in quotes))),
+    )
+
+
+def get_route_runs(live: bool | None = None) -> list[dict]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM route_runs ORDER BY id DESC").fetchall()
+    return [dict(r) for r in rows if live is None or bool(r["live"]) == live]
+
+
+def get_route_stats(live: bool | None = None) -> dict:
+    """Split routing vs the best single exchange, summed over all routed orders.
+
+    live=True -> only runs on real market data; False -> only mock; None -> all.
+    Runs with no single-venue alternative (not enough liquidity on any one venue)
+    are counted in `split_only` and left out of the comparison.
+    """
+    runs = get_route_runs(live)
+    cmp = [r for r in runs if r["gain_thb"] is not None]
+    gain = sum(r["gain_thb"] for r in cmp)
+    notional = sum(r["notional_thb"] for r in cmp)
+    return {
+        "runs": len(runs),
+        "compared": len(cmp),
+        "split_only": len(runs) - len(cmp),
+        "wins": sum(1 for r in cmp if r["gain_thb"] > 1e-9),
+        "total_gain_thb": gain,
+        "avg_gain_pct": gain / notional if notional else 0.0,
+    }
 
 
 # --- the two things you can do ---------------------------------------------
@@ -154,8 +205,11 @@ def sell(quote: Quote, coins: float) -> float:
     return thb
 
 
-def buy_split(legs: list[tuple[Quote, float]]) -> float:
-    """Execute multi-exchange buy legs atomically; each leg is (quote, THB)."""
+def buy_split(legs: list[tuple[Quote, float]], baseline: tuple[str, float] | None = None) -> float:
+    """Execute multi-exchange buy legs atomically; each leg is (quote, THB).
+
+    baseline = (exchange name, coins) the best single exchange would have given for the same THB.
+    """
     legs = [(q, float(amount)) for q, amount in legs if amount > 1e-8]
     if not legs:
         raise OrderError("No executable buy allocation.")
@@ -184,11 +238,19 @@ def buy_split(legs: list[tuple[Quote, float]]) -> float:
             _adjust(conn, asset, coins)
             _record(conn, quote, "Buy", coins, avg, fee, amount)
             total_coins += coins
+        gain = None
+        if baseline:
+            single_coins = math.floor(baseline[1] * 1e8) / 1e8      # same rounding as a real fill
+            gain = (total_coins - single_coins) * (total_thb / total_coins)   # coins -> THB
+        _record_route(conn, [q for q, *_ in prepared], "Buy", total_thb, baseline[0] if baseline else None, gain)
     return total_coins
 
 
-def sell_split(legs: list[tuple[Quote, float]]) -> float:
-    """Execute multi-exchange sell legs atomically; each leg is (quote, coins)."""
+def sell_split(legs: list[tuple[Quote, float]], baseline: tuple[str, float] | None = None) -> float:
+    """Execute multi-exchange sell legs atomically; each leg is (quote, coins).
+
+    baseline = (exchange name, net THB) the best single exchange would have paid for the same coins.
+    """
     legs = [(q, float(amount)) for q, amount in legs if amount > 1e-12]
     if not legs:
         raise OrderError("No executable sell allocation.")
@@ -213,4 +275,6 @@ def sell_split(legs: list[tuple[Quote, float]]) -> float:
             _adjust(conn, "THB", proceeds)
             _record(conn, quote, "Sell", amount, avg, fee, proceeds)
             total_thb += proceeds
+        gain = (total_thb - baseline[1]) if baseline else None
+        _record_route(conn, [q for q, *_ in prepared], "Sell", total_thb, baseline[0] if baseline else None, gain)
     return total_thb
