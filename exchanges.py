@@ -131,18 +131,24 @@ def build_mock_exchanges() -> list[Exchange]:
     ]
 
 
+ENV_PATHS = [Path(__file__).with_name(".env"), Path.cwd() / ".env"]
+
+
 def _load_env() -> None:
-    """Read KEY=value lines from a .env file next to this script into os.environ.
-    Real environment variables win. The file is git-ignored; never commit it."""
-    path = Path(__file__).with_name(".env")
-    if not path.is_file():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    """Read KEY=value lines from a .env file (next to this script, or the folder you ran
+    streamlit from) into os.environ. Real environment variables win. Never commit .env."""
+    for path in ENV_PATHS:
+        if not path.is_file():
             continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        # utf-8-sig: Windows Notepad often saves a hidden BOM that would break the first key name
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip().strip('"').strip("'")
+            if v:
+                os.environ.setdefault(k.strip(), v)
 
 
 _load_env()
@@ -260,7 +266,7 @@ class InnovestXExchange(RealExchange):
     def _headers(self):
         key = os.environ.get("INNOVESTX_API_KEY", "").strip()
         if not key:
-            raise RuntimeError("INNOVESTX_API_KEY is not set (put it in .env)")
+            raise RuntimeError(f"INNOVESTX_API_KEY is not set. Looked for: {', '.join(str(p) for p in ENV_PATHS)}")
         return {"X-MBX-APIKEY": key}
 
     def _params(self, symbol):
